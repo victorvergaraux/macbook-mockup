@@ -58,7 +58,7 @@ src/
 
 ## Deploy
 
-Proyecto desplegado en Vercel: https://vercel.com/victor-vergaras-projects/macbook-mockup/RyisGUmEWyxDbsbx88s7FDv1MK3q
+Proyecto desplegado en Vercel: https://macbook-mockup.vercel.app/
 
 Repositorio: https://github.com/victorvergaraux/macbook-mockup
 
