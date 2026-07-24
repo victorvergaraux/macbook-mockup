@@ -132,58 +132,150 @@ export default function App() {
   }, []);
 
   // ---- Leva controls ----
-  const { zoomMargin, fov, view, autoRotate, autoRotateSpeed } = useControls('Camara', {
-    view: { value: 'iso', options: ['iso', 'isoLeft', 'frontal', 'top'] },
-    zoomMargin: { value: 1.3, min: 0.3, max: 3, step: 0.05, label: 'encuadre (menor = mas zoom)' },
-    fov: { value: 18, min: 12, max: 45, step: 1, label: 'campo de vision (menor = mas tele)' },
-    autoRotate: false,
-    autoRotateSpeed: { value: 0.6, min: 0.1, max: 4, step: 0.1 },
-  });
-
-  const { screenMesh, imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness, reflectionIntensity } =
-    useControls('Pantalla', {
-      screenMesh: { value: 'auto', options: meshOptions },
-      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'ancho' },
-      imgScaleY: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'alto' },
-      offsetX: { value: 0, min: -1, max: 1, step: 0.01 },
-      offsetY: { value: 0, min: -1, max: 1, step: 0.01 },
-      imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotacion' },
-      brightness: { value: 1.15, min: 0.2, max: 3, step: 0.05, label: 'brillo' },
-      reflectionIntensity: { value: 0.02, min: 0, max: 1, step: 0.01, label: 'reflejo entorno' },
-    });
-
-  const { modelRotationY, lidAngle } = useControls('Modelo', {
-    modelRotationY: { value: 0, min: -180, max: 180, step: 1, label: 'rotacion Y' },
-    lidAngle: { value: 0, min: -75, max: 78, step: 1, label: 'angulo pantalla (- abre / + cierra)' },
-  });
-
-  const { envPreset, envIntensity, showBackground, bgColor, envAsBackground, blur } = useControls('Entorno', {
-    envPreset: { value: 'city', options: ENV_PRESETS },
-    envIntensity: { value: 0.2, min: 0, max: 3, step: 0.05, label: 'intensidad reflejos' },
-    showBackground: { value: true, label: 'fondo visible' },
-    bgColor: { value: '#eef0f2', label: 'color fondo' },
-    envAsBackground: { value: true, label: 'usar HDRI como fondo' },
-    blur: { value: 0.85, min: 0, max: 2, step: 0.05, label: 'desenfoque fondo HDRI' },
-  });
-
-  const { dofEnabled, focusDistance, focusRange, bokehScale, bloomEnabled, bloomIntensity, bloomThreshold } = useControls('Foco / Desenfoque', {
-    dofEnabled: { value: false, label: 'depth of field (macro)' },
-    focusDistance: {
-      value: 1,
-      min: 0.05,
-      max: 5,
-      step: 0.01,
-      label: 'distancia de foco (cerca camara -> lejos objeto)',
+  // Flat, single-level folders only (no nested sub-groups): keeps the panel
+  // easy to scan. Short labels throughout; everything in English.
+  const { zoomMargin, fov, view } = useControls(
+    'Camera',
+    {
+      view: { value: 'iso', options: ['iso', 'isoLeft', 'frontal', 'top'] },
+      zoomMargin: { value: 1.3, min: 0.3, max: 3, step: 0.05, label: 'framing' },
+      fov: { value: 18, min: 12, max: 45, step: 1, label: 'fov' },
     },
-    focusRange: { value: 0.3, min: 0.02, max: 3, step: 0.01, label: 'rango nitido (menor = mas macro)' },
-    bokehScale: { value: 3, min: 0, max: 10, step: 0.1, label: 'intensidad bokeh' },
-    bloomEnabled: { value: true, label: 'bloom pantalla' },
-    bloomThreshold: { value: 1.0, min: 0.5, max: 1.5, step: 0.01, label: 'umbral bloom' },
-    bloomIntensity: { value: 0.25, min: 0, max: 2, step: 0.05 },
-  });
+    { collapsed: true }
+  );
+
+  const {
+    screenMesh,
+    reflectionIntensity,
+    reflectionRoughness,
+  } = useControls(
+    'Screen',
+    {
+      screenMesh: { value: 'auto', options: meshOptions, label: 'mesh' },
+      reflectionIntensity: { value: 0.35, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      reflectionRoughness: { value: 0.08, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
+    },
+    { collapsed: true }
+  );
+
+  // Design: la imagen que el usuario carga (no el efecto/hardware de la
+  // pantalla, eso vive en 'Screen' arriba).
+  const { imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness } = useControls(
+    'Design',
+    {
+      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'width' },
+      imgScaleY: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'height' },
+      offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
+      offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
+      imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
+      brightness: { value: 1.15, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
+    },
+    { collapsed: true }
+  );
+
+  // autoRotate gira el modelo (grupo de Macbook), no la camara/OrbitControls:
+  // asi el usuario puede seguir orbitando la camara libremente sin pisar la
+  // rotacion automatica ni al reves.
+  const { modelRotationY, lidAngle, autoRotate, autoRotateSpeed } = useControls(
+    'Model',
+    {
+      modelRotationY: { value: 0, min: -180, max: 180, step: 1, label: 'rotation y' },
+      lidAngle: { value: 0, min: -75, max: 78, step: 1, label: 'lid angle' },
+      autoRotate: { value: false, label: 'auto rotate' },
+      autoRotateSpeed: { value: 0.1, min: -0.2, max: 0.2, step: 0.01, label: 'rotate speed' },
+    },
+    { collapsed: false }
+  );
+
+  // Chassis brushed-metal texture (normal/roughness/metalness map).
+  const { metalTiling, metalRoughnessAmount, metalMetalnessAmount, metalNormalIntensity } = useControls(
+    'Metal',
+    {
+      metalTiling: { value: 3, min: 1, max: 10, step: 1, label: 'tiling' },
+      metalRoughnessAmount: { value: 1, min: 0, max: 2, step: 0.05, label: 'roughness' },
+      metalMetalnessAmount: { value: 1, min: 0, max: 2, step: 0.05, label: 'metalness' },
+      metalNormalIntensity: { value: 0, min: 0, max: 3, step: 0.05, label: 'normal' },
+    },
+    { collapsed: true }
+  );
+
+  // Solo debug: revisar topologia de la malla.
+  const { wireframe } = useControls(
+    'Debug',
+    {
+      wireframe: { value: false, label: 'wireframe' },
+    },
+    { collapsed: true }
+  );
+
+  // Smudge overlay (separate glass layer over the image material). Folder
+  // name 'Screen' matches the other Screen useControls call above -- Leva
+  // merges same-named folders into one visual group in the panel. Todos los
+  // controles quedan siempre visibles, prendas o no el toggle Fingerprints.
+  const {
+    imperfectionEnabled,
+    fingerprintTiling,
+    fingerprintOpacity,
+    fingerprintRoughnessAmount,
+    fingerprintMetalnessAmount,
+    fingerprintNormalIntensity,
+    vignetteRadius,
+    vignetteIntensity,
+  } = useControls(
+    'Screen',
+    {
+      imperfectionEnabled: { value: false, label: 'Fingerprints' },
+      fingerprintTiling: { value: 1, min: 0.2, max: 5, step: 0.1, label: 'tiling' },
+      fingerprintOpacity: { value: 0.45, min: 0, max: 1, step: 0.01, label: 'opacity' },
+      fingerprintRoughnessAmount: { value: 0.4, min: 0, max: 1, step: 0.01, label: 'roughness' },
+      fingerprintMetalnessAmount: { value: 0.35, min: 0, max: 1, step: 0.01, label: 'metalness' },
+      fingerprintNormalIntensity: { value: 0.6, min: 0, max: 2, step: 0.05, label: 'normal' },
+      vignetteRadius: { value: 0.75, min: 0, max: 1, step: 0.01, label: 'radius' },
+      vignetteIntensity: { value: 0.7, min: 0, max: 1, step: 0.01, label: 'amount' },
+    },
+    { collapsed: true }
+  );
+
+  const { envPreset, envIntensity, showBackground, bgColor, envAsBackground, blur } = useControls(
+    'Environment',
+    {
+      envPreset: { value: 'city', options: ENV_PRESETS, label: 'preset' },
+      envIntensity: { value: 0.2, min: 0, max: 3, step: 0.05, label: 'intensity' },
+      showBackground: { value: true, label: 'background' },
+      bgColor: { value: '#eef0f2', label: 'bg color' },
+      envAsBackground: { value: true, label: 'hdri bg' },
+      blur: { value: 0.85, min: 0.2, max: 1, step: 0.05, label: 'blur' },
+    },
+    { collapsed: true }
+  );
+
+  const { dofEnabled, focusDistance, focusRange, bokehScale, bloomEnabled, bloomIntensity, bloomThreshold } =
+    useControls(
+      'Focus',
+      {
+        dofEnabled: { value: false, label: 'dof' },
+        focusDistance: { value: 1, min: 0.05, max: 5, step: 0.01, label: 'distance' },
+        focusRange: { value: 0.3, min: 0.02, max: 3, step: 0.01, label: 'range' },
+        bokehScale: { value: 3, min: 0, max: 10, step: 0.1, label: 'bokeh' },
+        bloomEnabled: { value: true, label: 'bloom' },
+        bloomThreshold: { value: 1.0, min: 0.5, max: 1.5, step: 0.01, label: 'threshold' },
+        bloomIntensity: { value: 0.25, min: 0, max: 2, step: 0.05, label: 'intensity' },
+      },
+      { collapsed: true }
+    );
+
+  // Toggle visible (a diferencia del resto de ajustes finos de sombra, mas
+  // abajo, que quedan ocultos del panel).
+  const { shadowEnabled } = useControls(
+    'Shadow',
+    {
+      shadowEnabled: { value: true, label: 'enabled' },
+    },
+    { collapsed: true }
+  );
 
   const { shadowOpacity, shadowBlur, shadowScale } = useControls(
-    'Sombra',
+    'Shadow',
     {
       shadowOpacity: { value: 1, min: 0, max: 1, step: 0.01 },
       shadowBlur: { value: 0.09, min: 0, max: 6, step: 0.01 },
@@ -198,13 +290,13 @@ export default function App() {
   const handleExportRef = useRef(() => {});
 
   const { format, quality, resolution, transparentBg } = useControls(
-    'Exportar',
+    'Export',
     {
       format: { value: 'png', options: ['png', 'jpg'] },
       quality: { value: 0.95, min: 0.5, max: 1, step: 0.01 },
       resolution: { value: 2, options: { '1x': 1, '2x': 2, '4x': 4 } },
-      transparentBg: { value: false, label: 'fondo transparente (png)' },
-      'Exportar imagen': button(() => handleExportRef.current()),
+      transparentBg: { value: false, label: 'transparent bg' },
+      'Export image': button(() => handleExportRef.current()),
     },
     { render: () => false }
   );
@@ -261,7 +353,7 @@ export default function App() {
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
     >
-      <Leva collapsed={true} titleBar={{ title: 'Controles de escena' }} className="leva-container" />
+      <Leva collapsed={false} titleBar={{ title: 'Scene Controls' }} className="leva-container" />
 
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
@@ -294,7 +386,7 @@ export default function App() {
       <div className="canvas-wrap">
         <Canvas
           camera={{ position: VIEW_PRESETS.iso, near: 0.1, far: 20, fov }}
-          gl={{ preserveDrawingBuffer: true, alpha: true, antialias: false }}
+          gl={{ preserveDrawingBuffer: true, alpha: true, antialias: true }}
           dpr={[1, 2]}
         >
           {showBackground && !envAsBackground && <color attach="background" args={[bgColor]} />}
@@ -302,7 +394,12 @@ export default function App() {
           <ambientLight intensity={0.6} />
           <directionalLight position={[5, 8, 5]} intensity={1.4} castShadow />
 
-          <Bounds fit observe margin={zoomMargin}>
+          {/* maxDuration=0: encuadre instantaneo, sin tween. Si el usuario
+              hace click/orbita mientras la camara todavia esta en transito,
+              Bounds intenta reconciliar el target de OrbitControls a mitad
+              de camino y la deja mal apuntada; sin animacion no hay ventana
+              en la que eso pueda pasar. */}
+          <Bounds fit observe margin={zoomMargin} maxDuration={0}>
             <ViewController view={view} zoomMargin={zoomMargin} fov={fov} />
             <Center top>
               <Macbook
@@ -314,19 +411,37 @@ export default function App() {
                 modelRotationY={modelRotationY}
                 lidAngle={lidAngle}
                 reflectionIntensity={reflectionIntensity}
+                reflectionRoughness={reflectionRoughness}
+                metalTiling={metalTiling}
+                metalRoughnessAmount={metalRoughnessAmount}
+                metalMetalnessAmount={metalMetalnessAmount}
+                metalNormalIntensity={metalNormalIntensity}
+                fingerprintTiling={fingerprintTiling}
+                fingerprintOpacity={fingerprintOpacity}
+                fingerprintRoughnessAmount={fingerprintRoughnessAmount}
+                fingerprintNormalIntensity={fingerprintNormalIntensity}
+                fingerprintMetalnessAmount={fingerprintMetalnessAmount}
+                vignetteRadius={vignetteRadius}
+                vignetteIntensity={vignetteIntensity}
+                imperfectionEnabled={imperfectionEnabled}
+                autoRotate={autoRotate}
+                autoRotateSpeed={autoRotateSpeed}
+                wireframe={wireframe}
               />
             </Center>
           </Bounds>
 
-          <ContactShadows
-            position={[0, -0.001, 0]}
-            opacity={shadowOpacity}
-            blur={shadowBlur}
-            scale={shadowScale}
-            far={4}
-            resolution={1024}
-            color="#000000"
-          />
+          {shadowEnabled && (
+            <ContactShadows
+              position={[0, -0.001, 0]}
+              opacity={shadowOpacity}
+              blur={shadowBlur}
+              scale={shadowScale}
+              far={4}
+              resolution={1024}
+              color="#000000"
+            />
+          )}
 
           <Environment
             preset={envPreset}
@@ -340,14 +455,16 @@ export default function App() {
             makeDefault
             enableDamping
             dampingFactor={0.08}
-            autoRotate={autoRotate}
-            autoRotateSpeed={autoRotateSpeed}
             minDistance={0.3}
             maxDistance={15}
           />
 
           {(dofEnabled || bloomEnabled) && (
-            <EffectComposer multisampling={0}>
+            // multisampling>0: cuando el composer esta montado (bloom/dof
+            // activos), renderiza a un render target offscreen que salta el
+            // antialias nativo del canvas -- sin esto, gl.antialias no hace
+            // nada visible mientras el composer este activo.
+            <EffectComposer multisampling={4}>
               {dofEnabled ? (
                 <DepthOfField
                   focusDistance={focusDistance}

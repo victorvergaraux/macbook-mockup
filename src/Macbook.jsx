@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
-import { useFrame, useThree } from '@react-three/fiber';
+import { useFrame, useLoader, useThree } from '@react-three/fiber';
 import modelUrl from '../src/macbook/source/macbook_pro_14_inch_M5.glb?url';
+import metalRoughnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Roughness.jpg?url';
+import metalMetalnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Metallic.jpg?url';
+import metalNormalUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Normal.png?url';
+import fingerprintRoughnessUrl from '../src/macbook/PBR/imperfection_0002_roughness_2k.jpg?url';
+import fingerprintNormalUrl from '../src/macbook/PBR/imperfection_0002_normal_opengl_2k.png?url';
+import fingerprintColorUrl from '../src/macbook/PBR/imperfection_0002_color_2k.jpg?url';
+import fingerprintOpacityMapUrl from '../src/macbook/PBR/imperfection_0002_opacity_2k.jpg?url';
 
 useGLTF.preload(modelUrl);
 
@@ -93,6 +100,74 @@ function guessScreenMesh(root) {
  * el transform visual de cada mesh (Object3D.attach). Rotar ese grupo en X
  * simula abrir/cerrar el computador.
  */
+/**
+ * Compone en un canvas la textura de imperfeccion (repetida `tileCount`
+ * veces para mantener el detalle) multiplicada por un degradado radial
+ * (negro=oculta, blanco=visible segun `intensity`) que arranca en `radius`
+ * (fraccion 0-1 de la distancia centro->esquina) y llega a las esquinas.
+ * Resultado: la mancha solo se nota cerca de las esquinas, con el centro
+ * de la pantalla limpio. Se recalcula solo cuando cambian los controles
+ * (no por frame), asi que el costo no afecta el frame rate.
+ */
+function buildVignetteAlphaCanvas(image, { tileCount, radius, intensity }) {
+  const size = 1024;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  const tiles = Math.max(1, Math.round(tileCount));
+  const tileSize = size / tiles;
+  for (let y = 0; y < tiles; y++) {
+    for (let x = 0; x < tiles; x++) {
+      ctx.drawImage(image, x * tileSize, y * tileSize, tileSize, tileSize);
+    }
+  }
+
+  ctx.globalCompositeOperation = 'multiply';
+  const cx = size / 2;
+  const cy = size / 2;
+  const maxR = Math.hypot(cx, cy); // distancia centro -> esquina
+  const innerR = maxR * THREE.MathUtils.clamp(radius, 0, 1);
+  const edgeGray = Math.round(255 * THREE.MathUtils.clamp(intensity, 0, 1));
+  const gradient = ctx.createRadialGradient(cx, cy, innerR, cx, cy, maxR);
+  gradient.addColorStop(0, '#000000');
+  gradient.addColorStop(1, `rgb(${edgeGray}, ${edgeGray}, ${edgeGray})`);
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  ctx.globalCompositeOperation = 'source-over';
+
+  return canvas;
+}
+
+/**
+ * Placeholder de pantalla apagada: fondo oscuro + texto centrado invitando
+ * a soltar una imagen. Se genera una sola vez (canvas estatico, sin
+ * controles) y se reemplaza por la textura del usuario en cuanto carga una.
+ */
+function buildPlaceholderScreenTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1600;
+  canvas.height = 1000;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#111214';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = 'bold 64px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Arrastra aquí tu diseño', canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  // Mismo criterio que useScreenTexture: UV de glTF con origen arriba-izq.
+  texture.flipY = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
 function buildLidPivot(clonedScene) {
   clonedScene.updateMatrixWorld(true);
 
@@ -122,15 +197,110 @@ export default function Macbook({
   modelRotationY,
   lidAngle,
   reflectionIntensity,
+  reflectionRoughness,
+  metalTiling,
+  metalRoughnessAmount,
+  metalMetalnessAmount,
+  metalNormalIntensity,
+  fingerprintTiling,
+  fingerprintOpacity,
+  fingerprintRoughnessAmount,
+  fingerprintNormalIntensity,
+  fingerprintMetalnessAmount,
+  vignetteRadius,
+  vignetteIntensity,
+  imperfectionEnabled,
+  autoRotate,
+  autoRotateSpeed,
+  wireframe,
   ...props
 }) {
   const { scene } = useGLTF(modelUrl);
   const { scene: r3fScene } = useThree();
   const clonedScene = useMemo(() => scene.clone(true), [scene]);
+  const groupRef = useRef(null);
+  const autoAngleRef = useRef(0);
   const screenMeshRef = useRef(null);
   const originalMaterialRef = useRef(null);
   const screenMaterialRef = useRef(null);
   const lidPivotRef = useRef(null);
+  const glassMeshRef = useRef(null);
+  const glassMaterialRef = useRef(null);
+  const vignetteAlphaTextureRef = useRef(null);
+  const placeholderTextureRef = useRef(null);
+  // Todo mesh que alguna vez fue "la pantalla" (seleccion manual via el
+  // dropdown puede cambiarla mas de una vez): se excluyen para siempre del
+  // efecto de metal, no solo el actual. Sin esto, al reasignar el selector
+  // "mesh" el mesh anterior queda con su material original restaurado pero
+  // ya no excluido, y la siguiente corrida del efecto de metal lo trata
+  // como chasis (roughness/metalness/normal del metal pisando su material
+  // real).
+  const usedScreenMeshesRef = useRef(new Set());
+
+  const [
+    metalRoughness,
+    metalMetalness,
+    metalNormal,
+    fingerprintRoughness,
+    fingerprintNormal,
+    fingerprintColor,
+    fingerprintAlpha,
+  ] = useLoader(THREE.TextureLoader, [
+    metalRoughnessUrl,
+    metalMetalnessUrl,
+    metalNormalUrl,
+    fingerprintRoughnessUrl,
+    fingerprintNormalUrl,
+    fingerprintColorUrl,
+    fingerprintOpacityMapUrl,
+  ]);
+
+  // Wrap/anisotropy una sola vez por textura (no depende de estado de React,
+  // evita reconfigurar en cada render -> costo cero en frame rate).
+  // anisotropy fijo y bajo (4) en vez de max del GPU: suficiente nitidez en
+  // angulo rasante para este uso, sin pagar el costo de filtrado mas caro.
+  // Metal usa MirroredRepeatWrapping (no RepeatWrapping): con tiles espejados
+  // alternados, dos tiles vecinos nunca son una copia identica -- se prueba
+  // esto primero, nativo de three.js, antes de hornear un canvas a mano.
+  useMemo(() => {
+    [metalRoughness, metalMetalness, metalNormal].forEach((tex) => {
+      tex.wrapS = tex.wrapT = THREE.MirroredRepeatWrapping;
+      tex.anisotropy = 4;
+    });
+    [fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha].forEach((tex) => {
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.anisotropy = 4;
+    });
+  }, [
+    metalRoughness,
+    metalMetalness,
+    metalNormal,
+    fingerprintRoughness,
+    fingerprintNormal,
+    fingerprintColor,
+    fingerprintAlpha,
+  ]);
+
+  // Repeticion (tiling) del set de metal, controlable desde Leva.
+  useEffect(() => {
+    const t = metalTiling ?? 3;
+    [metalRoughness, metalMetalness, metalNormal].forEach((tex) => {
+      tex.repeat.set(t, t);
+      tex.needsUpdate = true;
+    });
+  }, [metalTiling, metalRoughness, metalMetalness, metalNormal]);
+
+  // Textura de imperfeccion de la pantalla: separada por completo del set de
+  // metal del chasis (propia instancia, propio tiling), un solo tiling
+  // gobierna roughness/normal/metalness porque los tres vienen del mismo
+  // set imperfection_0002 y deben calzar en UV entre si.
+  useEffect(() => {
+    const t = fingerprintTiling ?? 1;
+    [fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha].forEach((tex) => {
+      tex.repeat.set(t, t);
+      tex.needsUpdate = true;
+    });
+  }, [fingerprintTiling, fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha]);
 
   // Lista de meshes disponibles (para el selector Leva) + resolucion inicial.
   useEffect(() => {
@@ -140,6 +310,13 @@ export default function Macbook({
     });
     onMeshList?.(names, guessScreenMesh(clonedScene)?.name ?? null);
   }, [clonedScene, onMeshList]);
+
+  // Nueva instancia de clonedScene (nuevo `scene.clone(true)`) invalida las
+  // referencias de mesh anteriores: sin este reset, usedScreenMeshesRef
+  // arrastraria objetos Mesh de una escena ya descartada.
+  useEffect(() => {
+    usedScreenMeshesRef.current = new Set();
+  }, [clonedScene]);
 
   // Arma el pivote de bisagra una sola vez por instancia de clonedScene.
   useEffect(() => {
@@ -177,6 +354,7 @@ export default function Macbook({
         originalMaterialRef.current = target.material;
       }
       screenMeshRef.current = target;
+      usedScreenMeshesRef.current.add(target);
 
       if (!screenMaterialRef.current) {
         // MeshBasicMaterial: no depende de las luces de la escena (pantalla
@@ -197,8 +375,163 @@ export default function Macbook({
         });
       }
       target.material = screenMaterialRef.current;
+
+      if (!glassMaterialRef.current) {
+        // Capa de "vidrio" independiente sobre la pantalla: separada del
+        // material de imagen (screenMaterialRef) para no arriesgar la logica
+        // de repeat/offset ya validada ahi. Solo aporta reflejo + variacion
+        // de rugosidad por huellas/imperfecciones, sin oscurecer la imagen.
+        // transmission no se usa (pasada extra de render, cara para 60fps);
+        // el efecto de vidrio se logra con roughness bajo + clearcoat + envMap.
+        // roughnessMap/normalMap/metalnessMap/alphaMap (la mancha de huella
+        // en si) los asigna el efecto de toggle mas abajo, no el constructor:
+        // asi "Fingerprint > enabled" puede quitarlos por completo (vidrio
+        // limpio y uniforme) sin ocultar el mesh entero, dejando siempre
+        // activo el reflejo base controlable con reflectionIntensity /
+        // reflectionRoughness aunque las huellas esten apagadas.
+        glassMaterialRef.current = new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: fingerprintOpacity ?? 0.45,
+          roughness: fingerprintRoughnessAmount ?? 0.4,
+          normalScale: new THREE.Vector2(
+            fingerprintNormalIntensity ?? 0.6,
+            fingerprintNormalIntensity ?? 0.6
+          ),
+          metalness: fingerprintMetalnessAmount ?? 0.35,
+          clearcoat: reflectionIntensity ?? 0.35,
+          clearcoatRoughness: reflectionRoughness ?? 0.08,
+          depthWrite: false,
+        });
+      }
+
+      // Reconstruye el mesh de vidrio sobre el target actual (mismo geometry
+      // + transform local que la pantalla, sin clonar geometria). Se recrea
+      // en cada resolucion de target en vez de reposicionar, mas simple que
+      // rastrear cambios de geometry entre distintos meshes de pantalla.
+      if (glassMeshRef.current?.parent) {
+        glassMeshRef.current.parent.remove(glassMeshRef.current);
+      }
+      const glassMesh = new THREE.Mesh(target.geometry, glassMaterialRef.current);
+      glassMesh.position.copy(target.position);
+      glassMesh.quaternion.copy(target.quaternion);
+      glassMesh.scale.copy(target.scale);
+      glassMesh.renderOrder = 1;
+      target.parent.add(glassMesh);
+      glassMeshRef.current = glassMesh;
     }
   }, [clonedScene, screenMeshName]);
+
+  // Toggle "Fingerprint > enabled": con las huellas apagadas, el vidrio
+  // queda uniforme (sin roughnessMap/normalMap/metalnessMap/alphaMap),
+  // limpio pero con su reflejo base intacto (clearcoat). Con las huellas
+  // prendidas, se asignan los mapas y se hornea la vinieta (alphaMap) en un
+  // canvas -- eso solo se recalcula cuando cambian estos controles, nunca
+  // por frame.
+  useEffect(() => {
+    const glassMat = glassMaterialRef.current;
+    if (!glassMat) return;
+
+    const enabled = imperfectionEnabled ?? false;
+
+    if (!enabled) {
+      glassMat.roughnessMap = null;
+      glassMat.normalMap = null;
+      glassMat.metalnessMap = null;
+      glassMat.alphaMap = null;
+      glassMat.needsUpdate = true;
+      return;
+    }
+
+    glassMat.roughnessMap = fingerprintRoughness;
+    glassMat.normalMap = fingerprintNormal;
+    glassMat.metalnessMap = fingerprintColor;
+
+    if (fingerprintAlpha.image) {
+      const canvas = buildVignetteAlphaCanvas(fingerprintAlpha.image, {
+        tileCount: fingerprintTiling ?? 1,
+        radius: vignetteRadius ?? 0.75,
+        intensity: vignetteIntensity ?? 0.7,
+      });
+
+      const prevTexture = vignetteAlphaTextureRef.current;
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
+      texture.needsUpdate = true;
+      vignetteAlphaTextureRef.current = texture;
+      glassMat.alphaMap = texture;
+      prevTexture?.dispose();
+    }
+
+    glassMat.needsUpdate = true;
+  }, [
+    imperfectionEnabled,
+    fingerprintRoughness,
+    fingerprintNormal,
+    fingerprintColor,
+    fingerprintAlpha,
+    fingerprintTiling,
+    vignetteRadius,
+    vignetteIntensity,
+    screenMeshName,
+  ]);
+
+  // PBR realista para el chasis de aluminio: normal/roughness/metalness maps
+  // (Poliigon MetalSteelBrushed) sumados al material horneado del GLB, que
+  // solo trae BaseColor. Se conserva ese color original; roughness/metalness
+  // se fuerzan a 1 para que el mapa controle el valor por completo (workflow
+  // metallic-roughness estandar). Se excluye:
+  // - usedScreenMeshesRef: cualquier mesh que alguna vez fue "la pantalla"
+  //   (no solo el actual -- reseleccionar el dropdown "mesh" no debe dejar
+  //   el anterior vulnerable a heredar metal PBR sobre su material real).
+  // - glassMeshRef: mesh de vidrio/huellas, agregado como hijo del mismo
+  //   parent que la pantalla, o sea que clonedScene.traverse tambien lo
+  //   recorre -- sin esta exclusion, su material quedaba pisado con los
+  //   mapas/valores del metal del chasis.
+  // mat.__pbrApplied evita reprocesar el mismo material compartido si el
+  // efecto corre mas de una vez (ej. modo estricto de React). Los tres mapas
+  // son la misma instancia de textura siempre (wrap/repeat nativo, ver
+  // arriba), no hace falta reasignarlos en cada corrida.
+  useEffect(() => {
+    clonedScene.traverse((child) => {
+      if (!child.isMesh || usedScreenMeshesRef.current.has(child) || child === glassMeshRef.current) return;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((mat) => {
+        if (!mat) return;
+        if (!mat.__pbrApplied) {
+          mat.roughnessMap = metalRoughness;
+          mat.normalMap = metalNormal;
+          mat.metalnessMap = metalMetalness;
+          mat.__pbrApplied = true;
+        }
+        mat.roughness = metalRoughnessAmount ?? 1;
+        mat.metalness = metalMetalnessAmount ?? 1;
+        mat.normalScale.set(metalNormalIntensity ?? 1, metalNormalIntensity ?? 1);
+        mat.needsUpdate = true;
+      });
+    });
+  }, [
+    clonedScene,
+    screenMeshName,
+    metalNormal,
+    metalRoughness,
+    metalMetalness,
+    metalRoughnessAmount,
+    metalMetalnessAmount,
+    metalNormalIntensity,
+  ]);
+
+  // Ajustes en vivo de la capa de vidrio/huellas (el material ya existe,
+  // creado en el efecto de resolucion de pantalla de arriba).
+  useEffect(() => {
+    const glassMat = glassMaterialRef.current;
+    if (!glassMat) return;
+    glassMat.opacity = fingerprintOpacity ?? 0.45;
+    glassMat.roughness = fingerprintRoughnessAmount ?? 0.4;
+    glassMat.normalScale.set(fingerprintNormalIntensity ?? 0.6, fingerprintNormalIntensity ?? 0.6);
+    glassMat.metalness = fingerprintMetalnessAmount ?? 0.35;
+    glassMat.needsUpdate = true;
+  }, [fingerprintOpacity, fingerprintRoughnessAmount, fingerprintNormalIntensity, fingerprintMetalnessAmount]);
 
   // Aplica la textura subida + transform (scale/offset/rotation) + brillo.
   useEffect(() => {
@@ -222,19 +555,39 @@ export default function Macbook({
       // encendida"; <1 atenua.
       mat.color = new THREE.Color().setScalar(brightness ?? 1);
     } else {
-      mat.map = null;
-      mat.color = new THREE.Color(0x111214);
+      // Sin imagen cargada: placeholder con texto invitando a soltar una
+      // imagen, en vez de pantalla plana apagada. El canvas ya trae su
+      // propio fondo oscuro pintado, por eso color queda blanco (map sin
+      // modificar) en vez del 0x111214 fijo de antes.
+      if (!placeholderTextureRef.current) {
+        placeholderTextureRef.current = buildPlaceholderScreenTexture();
+      }
+      const placeholder = placeholderTextureRef.current;
+      placeholder.repeat.set(1, 1);
+      placeholder.offset.set(0, 0);
+      placeholder.rotation = 0;
+      mat.map = placeholder;
+      mat.color = new THREE.Color(0xffffff);
     }
     mat.needsUpdate = true;
   }, [screenTexture, imageTransform, brightness]);
 
-  // Intensidad del reflejo (reflectivity de MeshBasicMaterial, 0-1).
+  // Intensidad del reflejo (reflectivity de MeshBasicMaterial, 0-1) +
+  // nitidez del reflejo del vidrio (clearcoatRoughness: 0 = espejo nitido,
+  // 1 = reflejo bien difuso/borroso).
   useEffect(() => {
     const mat = screenMaterialRef.current;
-    if (!mat) return;
-    mat.reflectivity = reflectionIntensity ?? 0;
-    mat.needsUpdate = true;
-  }, [reflectionIntensity]);
+    if (mat) {
+      mat.reflectivity = reflectionIntensity ?? 0.35;
+      mat.needsUpdate = true;
+    }
+    const glassMat = glassMaterialRef.current;
+    if (glassMat) {
+      glassMat.clearcoat = reflectionIntensity ?? 0.35;
+      glassMat.clearcoatRoughness = reflectionRoughness ?? 0.08;
+      glassMat.needsUpdate = true;
+    }
+  }, [reflectionIntensity, reflectionRoughness]);
 
   // El envMap de un MeshBasicMaterial no se hereda solo de scene.environment
   // (eso es automatico para materiales PBR, no para Basic); hay que
@@ -244,15 +597,46 @@ export default function Macbook({
   // esta garantizado.
   useFrame(() => {
     const mat = screenMaterialRef.current;
-    if (!mat) return;
-    if (mat.envMap !== r3fScene.environment) {
+    if (mat && mat.envMap !== r3fScene.environment) {
       mat.envMap = r3fScene.environment;
       mat.needsUpdate = true;
+    }
+    const glassMat = glassMaterialRef.current;
+    if (glassMat && glassMat.envMap !== r3fScene.environment) {
+      glassMat.envMap = r3fScene.environment;
+      glassMat.needsUpdate = true;
+    }
+  });
+
+  // Solo debug: revisar topologia de la malla. Aplica a todo material que
+  // aparezca en el arbol (chasis, pantalla, vidrio incluido, ya que
+  // clonedScene.traverse tambien llega al glassMesh -- ver comentario del
+  // efecto de PBR del metal mas arriba sobre por que esta en el arbol).
+  useEffect(() => {
+    clonedScene.traverse((child) => {
+      if (!child.isMesh) return;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((mat) => {
+        if (mat) mat.wireframe = wireframe ?? false;
+      });
+    });
+  }, [clonedScene, wireframe, screenMeshName, imperfectionEnabled]);
+
+  // Auto-rotacion del modelo, no de la camara/OrbitControls: se acumula en
+  // un ref (no en estado de React) y se aplica imperativamente al grupo cada
+  // frame, sumada al offset manual de "Model > rotation y". Asi orbitar la
+  // camara con el mouse nunca interfiere con este giro ni al reves.
+  useFrame((_, delta) => {
+    if (autoRotate) {
+      autoAngleRef.current += delta * (autoRotateSpeed ?? 0.1);
+    }
+    if (groupRef.current) {
+      groupRef.current.rotation.y = THREE.MathUtils.degToRad(modelRotationY ?? 0) + autoAngleRef.current;
     }
   });
 
   return (
-    <group rotation={[0, THREE.MathUtils.degToRad(modelRotationY ?? 0), 0]} {...props}>
+    <group ref={groupRef} {...props}>
       <primitive object={clonedScene} />
     </group>
   );
