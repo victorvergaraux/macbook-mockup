@@ -417,7 +417,7 @@ export default function App() {
     'Screen',
     () => ({
       screenMesh: { value: 'auto', options: meshOptions, label: 'mesh' },
-      reflectionIntensity: { value: 0.35, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      reflectionIntensity: { value: 0.3, min: 0, max: 1, step: 0.01, label: 'reflection' },
       reflectionRoughness: { value: 0.08, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
     { collapsed: true }
@@ -433,7 +433,7 @@ export default function App() {
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
       offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
-      brightness: { value: 1.15, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
+      brightness: { value: 1.4, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
     }),
     { collapsed: true }
   );
@@ -460,8 +460,8 @@ export default function App() {
     'Metal',
     () => ({
       metalTiling: { value: 3, min: 1, max: 10, step: 1, label: 'tiling' },
-      metalRoughnessAmount: { value: 1, min: 0, max: 2, step: 0.05, label: 'roughness' },
-      metalMetalnessAmount: { value: 1, min: 0, max: 2, step: 0.05, label: 'metalness' },
+      metalRoughnessAmount: { value: 1.3, min: 0, max: 2, step: 0.05, label: 'roughness' },
+      metalMetalnessAmount: { value: 0.95, min: 0, max: 2, step: 0.05, label: 'metalness' },
       metalNormalIntensity: { value: 0, min: 0, max: 3, step: 0.05, label: 'normal' },
     }),
     { collapsed: true }
@@ -496,13 +496,13 @@ export default function App() {
     'Screen',
     () => ({
       imperfectionEnabled: { value: false, label: 'Fingerprints' },
-      fingerprintTiling: { value: 1, min: 0.2, max: 5, step: 0.1, label: 'tiling' },
-      fingerprintOpacity: { value: 0.45, min: 0, max: 1, step: 0.01, label: 'opacity' },
-      fingerprintRoughnessAmount: { value: 0.4, min: 0, max: 1, step: 0.01, label: 'roughness' },
-      fingerprintMetalnessAmount: { value: 0.35, min: 0, max: 1, step: 0.01, label: 'metalness' },
-      fingerprintNormalIntensity: { value: 0.6, min: 0, max: 2, step: 0.05, label: 'normal' },
-      vignetteRadius: { value: 0.75, min: 0, max: 1, step: 0.01, label: 'radius' },
-      vignetteIntensity: { value: 0.7, min: 0, max: 1, step: 0.01, label: 'amount' },
+      fingerprintTiling: { value: 0.2, min: 0.2, max: 5, step: 0.1, label: 'tiling' },
+      fingerprintOpacity: { value: 0.51, min: 0, max: 1, step: 0.01, label: 'opacity' },
+      fingerprintRoughnessAmount: { value: 0.36, min: 0, max: 1, step: 0.01, label: 'roughness' },
+      fingerprintMetalnessAmount: { value: 0.57, min: 0, max: 1, step: 0.01, label: 'metalness' },
+      fingerprintNormalIntensity: { value: 0.2, min: 0, max: 2, step: 0.05, label: 'normal' },
+      vignetteRadius: { value: 0.7, min: 0, max: 1, step: 0.01, label: 'radius' },
+      vignetteIntensity: { value: 0.18, min: 0, max: 1, step: 0.01, label: 'amount' },
     }),
     { collapsed: true }
   );
@@ -514,11 +514,11 @@ export default function App() {
     'Environment',
     () => ({
       envPreset: { value: 'city', options: ENV_PRESETS, label: 'preset' },
-      envIntensity: { value: 0.2, min: 0, max: 3, step: 0.05, label: 'intensity' },
+      envIntensity: { value: 0.15, min: 0, max: 3, step: 0.05, label: 'intensity' },
       bgColor: { value: '#eef0f2', label: 'bg color' },
       envAsBackground: { value: true, label: 'hdri bg' },
-      blur: { value: 0.85, min: 0.2, max: 1, step: 0.05, label: 'blur' },
-      envRotationY: { value: 0, min: 0, max: 360, step: 1, label: 'hdri rotation' },
+      blur: { value: 0.8, min: 0.2, max: 1, step: 0.05, label: 'blur' },
+      envRotationY: { value: 181, min: 0, max: 360, step: 1, label: 'hdri rotation' },
     }),
     { collapsed: true }
   );
@@ -555,7 +555,7 @@ export default function App() {
     () => ({
       shadowOpacity: { value: 1, min: 0, max: 1, step: 0.01 },
       shadowBlur: { value: 0.09, min: 0, max: 6, step: 0.01 },
-      shadowScale: { value: 4, min: 4, max: 30, step: 1 },
+      shadowScale: { value: 7, min: 4, max: 30, step: 1 },
     }),
     { render: () => false }
   );
