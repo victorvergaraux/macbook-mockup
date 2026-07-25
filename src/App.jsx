@@ -14,6 +14,8 @@ import { useControls, button, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { exportCanvas } from './exporter.js';
+import { CinematicRig } from './Cinematic.jsx';
+import { SHOTS, CINEMATIC_CONFIG } from './shots.js';
 
 const ENV_PRESETS = ['studio', 'city', 'sunset', 'dawn', 'warehouse', 'apartment', 'forest', 'lobby'];
 
@@ -25,61 +27,6 @@ const VIEW_PRESETS = {
   frontal: [0, 0.35, 2.2],
   top: [0, 2.2, 0.01],
 };
-
-// Combinaciones predefinidas de textura/pantalla. Cada preset escribe en
-// varios folders del panel (Metal, Screen, Design, Environment) a la vez.
-const MATERIAL_PRESETS = [
-  {
-    id: 'clean',
-    label: 'Clean',
-    tunedAt: '2026-07-25',
-    metalRoughnessAmount: 1.3,
-    metalMetalnessAmount: 0.95,
-    metalNormalIntensity: 0,
-    imperfectionEnabled: false,
-    fingerprintTiling: 0.2,
-    fingerprintOpacity: 0,
-    fingerprintRoughnessAmount: 0,
-    fingerprintMetalnessAmount: 0,
-    fingerprintNormalIntensity: 0,
-    vignetteRadius: 0,
-    vignetteIntensity: 0,
-    brightness: 1.4,
-    reflectionIntensity: 0.3,
-    reflectionRoughness: 0.08,
-    envPreset: 'city',
-    envIntensity: 0.15,
-    envAsBackground: true,
-    blur: 0.8,
-    envRotationY: 181,
-    shadowScale: 7,
-  },
-  {
-    id: 'used',
-    label: 'Used',
-    tunedAt: '2026-07-25',
-    metalRoughnessAmount: 1.3,
-    metalMetalnessAmount: 0.95,
-    metalNormalIntensity: 0,
-    imperfectionEnabled: true,
-    fingerprintTiling: 0.2,
-    fingerprintOpacity: 0.51,
-    fingerprintRoughnessAmount: 0.36,
-    fingerprintMetalnessAmount: 0.57,
-    fingerprintNormalIntensity: 0.2,
-    vignetteRadius: 0.7,
-    vignetteIntensity: 0.18,
-    brightness: 1.4,
-    reflectionIntensity: 0.3,
-    reflectionRoughness: 0.08,
-    envPreset: 'city',
-    envIntensity: 0.15,
-    envAsBackground: true,
-    blur: 0.8,
-    envRotationY: 181,
-    shadowScale: 7,
-  },
-];
 
 // Presets de camara: posicion/target absolutos + duracion de tween (seg) y
 // ajuste de bloom/dof que acompana cada encuadre.
@@ -307,7 +254,7 @@ function CaptureRig({ registerCapture }) {
 }
 
 /** Vive dentro de <Bounds>: encuadra la camara al modelo y aplica presets de vista/zoom. */
-function ViewController({ view, zoomMargin, fov }) {
+function ViewController({ view, zoomMargin, fov, refitToken }) {
   const bounds = useBounds();
   const { camera } = useThree();
 
@@ -323,12 +270,19 @@ function ViewController({ view, zoomMargin, fov }) {
     // (Bounds.fit() usa el fov actual de la camara para calcular esa
     // distancia). Sin este refit, cambiar fov deja la camara a la
     // distancia vieja y el objeto queda mal encuadrado o clipeado.
+    //
+    // refitToken (no se lee en el cuerpo): App lo incrementa al apagar la
+    // cinematica. CinematicRig muta camera.fov/camera.position de forma
+    // imperativa mientras esta activa, por fuera de este efecto -- sin este
+    // token el fov quedaria en el ultimo valor que dejo la ultima toma en
+    // vez de volver al valor real del slider "fov" al salir del modo
+    // cinematico.
     bounds
       .refresh()
       .reset()
       .to({ position: VIEW_PRESETS[view] ?? VIEW_PRESETS.iso, target: [0, 0, 0] })
       .fit();
-  }, [view, zoomMargin, fov, camera, bounds]);
+  }, [view, zoomMargin, fov, camera, bounds, refitToken]);
 
   return null;
 }
@@ -371,21 +325,11 @@ export default function App() {
   );
 
   // Botones de presets. El schema se arma una sola vez (useMemo sin deps) y
-  // cada boton lee la version mas reciente de applyMaterialPreset/
-  // applyCameraPreset a traves de un ref (mismo patron que handleExportRef
-  // mas abajo), ya que esas funciones dependen de los `set` de otros
-  // useControls definidos despues en el componente.
-  const applyPresetsRef = useRef({ material: () => {}, camera: () => {} });
-
-  const materialPresetSchema = useMemo(
-    () =>
-      MATERIAL_PRESETS.reduce((acc, preset) => {
-        acc[preset.label] = button(() => applyPresetsRef.current.material(preset));
-        return acc;
-      }, {}),
-    []
-  );
-  useControls('Material Presets', materialPresetSchema, { collapsed: false });
+  // cada boton lee la version mas reciente de applyCameraPreset a traves de
+  // un ref (mismo patron que handleExportRef mas abajo), ya que esa funcion
+  // depende de los `set` de otros useControls definidos despues en el
+  // componente.
+  const applyPresetsRef = useRef({ camera: () => {} });
 
   const cameraPresetSchema = useMemo(
     () =>
@@ -397,17 +341,6 @@ export default function App() {
   );
   useControls('Camera Presets', cameraPresetSchema, { render: () => false });
 
-  // Boton "Copy JSON": mismo patron de ref que handleExportRef mas abajo --
-  // handleCopyConfig se arma al final del componente (necesita el valor
-  // actual de todos los controles) pero el schema del boton se registra
-  // aqui arriba una sola vez.
-  const handleCopyConfigRef = useRef(() => {});
-  useControls(
-    'Config',
-    { 'Copy JSON': button(() => handleCopyConfigRef.current()) },
-    { collapsed: false }
-  );
-
   const [cameraRequest, setCameraRequest] = useState(null);
 
   const [
@@ -417,8 +350,8 @@ export default function App() {
     'Screen',
     () => ({
       screenMesh: { value: 'auto', options: meshOptions, label: 'mesh' },
-      reflectionIntensity: { value: 0.3, min: 0, max: 1, step: 0.01, label: 'reflection' },
-      reflectionRoughness: { value: 0.08, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
+      reflectionIntensity: { value: 0.4, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      reflectionRoughness: { value: 0.25, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
     { collapsed: true }
   );
@@ -433,7 +366,7 @@ export default function App() {
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
       offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
-      brightness: { value: 1.4, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
+      brightness: { value: 1.7, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
     }),
     { collapsed: true }
   );
@@ -441,14 +374,23 @@ export default function App() {
   // autoRotate gira el modelo (grupo de Macbook), no la camara/OrbitControls:
   // asi el usuario puede seguir orbitando la camara libremente sin pisar la
   // rotacion automatica ni al reves.
-  const { modelRotationY, lidAngle, autoRotate, autoRotateSpeed } = useControls(
+  // Forma de funcion (en vez del objeto plano original) para obtener el
+  // `set` de este folder: la cinematica lo necesita para forzar
+  // modelRotationY=0 + autoRotate=true al activarse y restaurar los valores
+  // previos al desactivarse (ver activacion/desactivacion de `cinematicActive`
+  // mas abajo).
+  const [{ modelRotationY, lidAngle, autoRotate, autoRotateSpeed }, setModel] = useControls(
     'Model',
-    {
+    () => ({
       modelRotationY: { value: 0, min: -180, max: 180, step: 1, label: 'rotation y' },
-      lidAngle: { value: 0, min: -75, max: 78, step: 1, label: 'lid angle' },
+      // Rango recalibrado para el GLB actual (nodo "screen" con pivot propio
+      // en la bisagra, ver Macbook.jsx): 0 = tapa exactamente vertical (90
+      // grados abierta), positivo cierra hacia el cuerpo, negativo abre mas
+      // alla de vertical (~-20 = limite practico, tapa casi horizontal).
+      lidAngle: { value: -20, min: -20, max: 90, step: 1, label: 'lid angle' },
       autoRotate: { value: false, label: 'auto rotate' },
-      autoRotateSpeed: { value: 0.1, min: -0.2, max: 0.2, step: 0.01, label: 'rotate speed' },
-    },
+      autoRotateSpeed: { value: 0.05, min: -0.2, max: 0.2, step: 0.01, label: 'rotate speed' },
+    }),
     { collapsed: false }
   );
 
@@ -464,7 +406,7 @@ export default function App() {
       metalMetalnessAmount: { value: 0.95, min: 0, max: 2, step: 0.05, label: 'metalness' },
       metalNormalIntensity: { value: 0, min: 0, max: 3, step: 0.05, label: 'normal' },
     }),
-    { collapsed: true }
+    { render: () => false }
   );
 
   // Solo debug: revisar topologia de la malla.
@@ -495,14 +437,14 @@ export default function App() {
   ] = useControls(
     'Screen',
     () => ({
-      imperfectionEnabled: { value: false, label: 'Fingerprints' },
-      fingerprintTiling: { value: 0.2, min: 0.2, max: 5, step: 0.1, label: 'tiling' },
-      fingerprintOpacity: { value: 0.51, min: 0, max: 1, step: 0.01, label: 'opacity' },
-      fingerprintRoughnessAmount: { value: 0.36, min: 0, max: 1, step: 0.01, label: 'roughness' },
-      fingerprintMetalnessAmount: { value: 0.57, min: 0, max: 1, step: 0.01, label: 'metalness' },
-      fingerprintNormalIntensity: { value: 0.2, min: 0, max: 2, step: 0.05, label: 'normal' },
-      vignetteRadius: { value: 0.7, min: 0, max: 1, step: 0.01, label: 'radius' },
-      vignetteIntensity: { value: 0.18, min: 0, max: 1, step: 0.01, label: 'amount' },
+      imperfectionEnabled: { value: true, label: 'Fingerprints' },
+      fingerprintTiling: { value: 1, min: 0.2, max: 5, step: 1.0, label: 'tiling' },
+      fingerprintOpacity: { value: 0.02, min: 0, max: 1, step: 0.01, label: 'opacity' },
+      fingerprintRoughnessAmount: { value: 0.13, min: 0, max: 1, step: 0.01, label: 'roughness' },
+      fingerprintMetalnessAmount: { value: 0.5, min: 0, max: 1, step: 0.01, label: 'metalness' },
+      fingerprintNormalIntensity: { value: 0.6, min: 0, max: 2, step: 0.01, label: 'normal' },
+      vignetteRadius: { value: 0.61, min: 0, max: 1, step: 0.01, label: 'radius' },
+      vignetteIntensity: { value: 0.04, min: 0, max: 1, step: 0.01, label: 'amount' },
     }),
     { collapsed: true }
   );
@@ -513,10 +455,10 @@ export default function App() {
   ] = useControls(
     'Environment',
     () => ({
-      envPreset: { value: 'city', options: ENV_PRESETS, label: 'preset' },
-      envIntensity: { value: 0.15, min: 0, max: 3, step: 0.05, label: 'intensity' },
-      bgColor: { value: '#eef0f2', label: 'bg color' },
-      envAsBackground: { value: true, label: 'hdri bg' },
+      envPreset: { value: 'studio', options: ENV_PRESETS, label: 'preset' },
+      envIntensity: { value: 0.65, min: 0, max: 3, step: 0.05, label: 'intensity' },
+      bgColor: { value: '#0080ff', label: 'bg color' },
+      envAsBackground: { value: false, label: 'hdri bg' },
       blur: { value: 0.8, min: 0.2, max: 1, step: 0.05, label: 'blur' },
       envRotationY: { value: 181, min: 0, max: 360, step: 1, label: 'hdri rotation' },
     }),
@@ -545,7 +487,7 @@ export default function App() {
   const { shadowEnabled } = useControls(
     'Shadow',
     {
-      shadowEnabled: { value: true, label: 'enabled' },
+      shadowEnabled: { value: false, label: 'enabled' },
     },
     { collapsed: true }
   );
@@ -577,39 +519,264 @@ export default function App() {
     { render: () => false }
   );
 
-  const applyMaterialPreset = useCallback(
-    (preset) => {
-      setMetal({
-        metalRoughnessAmount: preset.metalRoughnessAmount,
-        metalMetalnessAmount: preset.metalMetalnessAmount,
-        metalNormalIntensity: preset.metalNormalIntensity,
-      });
-      setFingerprint({
-        imperfectionEnabled: preset.imperfectionEnabled,
-        fingerprintTiling: preset.fingerprintTiling,
-        fingerprintOpacity: preset.fingerprintOpacity,
-        fingerprintRoughnessAmount: preset.fingerprintRoughnessAmount,
-        fingerprintMetalnessAmount: preset.fingerprintMetalnessAmount,
-        fingerprintNormalIntensity: preset.fingerprintNormalIntensity,
-        vignetteRadius: preset.vignetteRadius,
-        vignetteIntensity: preset.vignetteIntensity,
-      });
-      setDesign({ brightness: preset.brightness });
-      setScreenReflection({
-        reflectionIntensity: preset.reflectionIntensity,
-        reflectionRoughness: preset.reflectionRoughness,
-      });
-      setEnvironment({
-        envPreset: preset.envPreset,
-        envIntensity: preset.envIntensity,
-        envAsBackground: preset.envAsBackground,
-        blur: preset.blur,
-        envRotationY: preset.envRotationY,
-      });
-      setShadow({ shadowScale: preset.shadowScale });
-    },
-    [setMetal, setFingerprint, setDesign, setScreenReflection, setEnvironment, setShadow]
+  // ---- Cinematica ----
+  // Tomas guardadas: arrancan desde src/shots.js (la fuente de verdad
+  // versionada en git) y se espejan en localStorage como red de seguridad
+  // mientras se van capturando -- shots.js manda si se limpia el storage o
+  // si se pega un archivo nuevo, localStorage solo evita perder capturas de
+  // una sesion en curso antes de pegarlas en el archivo.
+  const [shots, setShots] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem('cinematicShots');
+      return saved ? JSON.parse(saved) : SHOTS;
+    } catch {
+      return SHOTS;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('cinematicShots', JSON.stringify(shots));
+    } catch {
+      // Storage lleno/deshabilitado: no es fatal, solo se pierde la red de
+      // seguridad, shots.js sigue siendo la fuente real.
+    }
+  }, [shots]);
+
+  const pendingPoseARef = useRef(null);
+  const cinematicApiRef = useRef(null);
+  const registerCinematicApi = useCallback((api) => {
+    cinematicApiRef.current = api;
+  }, []);
+  // Override imperativo del angulo del lid durante la cinematica (ver
+  // Macbook.jsx: useFrame usa `lidAngleRef?.current ?? lidAngle`). Solo se
+  // pasa a <Macbook> mientras cinematicActive es true -- ver JSX mas abajo --
+  // para que el slider "lid angle" de Leva mande de nuevo apenas se apaga.
+  const lidAngleRef = useRef(CINEMATIC_CONFIG.lidEnd);
+  const [rotationResetKey, setRotationResetKey] = useState(0);
+  const [refitToken, setRefitToken] = useState(0);
+  const preCinematicSnapshotRef = useRef(null);
+  const prevCinematicActiveRef = useRef(false);
+  const cinematicActionsRef = useRef({});
+
+  const cinematicShotOptions = useMemo(() => {
+    if (!shots.length) return { '(sin tomas)': '' };
+    const opts = {};
+    shots.forEach((shot) => {
+      opts[shot.name] = shot.name;
+    });
+    return opts;
+  }, [shots]);
+
+  // El folder completo se deja visible mientras se capturan tomas. Una vez
+  // pegado el resultado de "Copy shots.js" en src/shots.js, cambiar
+  // `{ collapsed: true }` de abajo por `{ render: () => false }` (mismo
+  // patron que el folder oculto 'Camera Presets' mas arriba) para ocultar el
+  // panel sin afectar en nada la reproduccion, que siempre lee de `shots`.
+  const [
+    { cinematicActive, lidDurationSec, shotDurationSec, shotSelect },
+    setCinematic,
+  ] = useControls(
+    'Cinematic',
+    () => ({
+      cinematicActive: { value: false, label: 'active' },
+      lidDurationSec: {
+        value: CINEMATIC_CONFIG.lidDuration,
+        min: 2,
+        max: 10,
+        step: 0.5,
+        label: 'lid duration (s)',
+      },
+      shotDurationSec: {
+        value: CINEMATIC_CONFIG.shotDuration,
+        min: 0.5,
+        max: 15,
+        step: 0.1,
+        label: 'shot duration (s)',
+      },
+      'Capture A': button(() => cinematicActionsRef.current.captureA?.()),
+      'Capture B + Save': button(() => cinematicActionsRef.current.captureBAndSave?.()),
+      'Capture static': button(() => cinematicActionsRef.current.captureStatic?.()),
+      shotSelect: { value: shots[0]?.name ?? '', options: cinematicShotOptions, label: 'shots' },
+      'Preview shot': button(() => cinematicActionsRef.current.previewShot?.()),
+      'Delete shot': button(() => cinematicActionsRef.current.deleteShot?.()),
+      'Copy shots.js': button(() => cinematicActionsRef.current.copyShotsFile?.()),
+    }),
+    { collapsed: true },
+    [cinematicShotOptions]
   );
+
+  // Las tomas son poses absolutas de mundo (ver comentario en shots.js): si
+  // se capturan con el modelo girado o autorrotando, la composicion no va a
+  // coincidir al reproducir. Se exige esta condicion antes de dejar
+  // capturar en vez de documentarla solamente.
+  const requireCleanPoseForCapture = useCallback(() => {
+    if (modelRotationY !== 0 || autoRotate) {
+      window.alert(
+        'Antes de capturar: en el folder "Model" pon "rotation y" en 0 y apaga "auto rotate". ' +
+          'Las tomas son poses absolutas y deben capturarse con el modelo en su orientacion base.'
+      );
+      return false;
+    }
+    return true;
+  }, [modelRotationY, autoRotate]);
+
+  // Las tomas no cargan su propia duracion -- ver Cinematic.jsx / shots.js:
+  // todas duran exactamente `shotDurationSec` (uniforme), asi el largo total
+  // del ciclo es siempre shots.length * shotDurationSec.
+  const saveShot = useCallback(
+    (poseA, poseB) => {
+      const name = window.prompt(
+        'Nombre de la toma (sin numeros, ej. "Frontal", "Lateral derecha arriba", "Contrapicada derecha"):'
+      );
+      if (!name) return;
+      if (shots.some((shot) => shot.name === name)) {
+        window.alert(`Ya existe una toma llamada "${name}". Elegi otro nombre.`);
+        return;
+      }
+      setShots((prev) => [...prev, { name, a: poseA, b: poseB ?? null }]);
+      setCinematic({ shotSelect: name });
+    },
+    [shots, setCinematic]
+  );
+
+  const captureA = useCallback(() => {
+    if (!requireCleanPoseForCapture()) return;
+    const pose = cinematicApiRef.current?.capturePose();
+    if (!pose) return;
+    pendingPoseARef.current = pose;
+    window.alert('Pose A capturada. Ajusta la camara y usa "Capture B + Save" (o "Capture static" para una toma fija).');
+  }, [requireCleanPoseForCapture]);
+
+  const captureBAndSave = useCallback(() => {
+    if (!requireCleanPoseForCapture()) return;
+    if (!pendingPoseARef.current) {
+      window.alert('Primero captura la pose A con "Capture A".');
+      return;
+    }
+    const poseB = cinematicApiRef.current?.capturePose();
+    if (!poseB) return;
+    saveShot(pendingPoseARef.current, poseB);
+    pendingPoseARef.current = null;
+  }, [requireCleanPoseForCapture, saveShot]);
+
+  const captureStatic = useCallback(() => {
+    if (!requireCleanPoseForCapture()) return;
+    const pose = cinematicApiRef.current?.capturePose();
+    if (!pose) return;
+    saveShot(pose, null);
+    pendingPoseARef.current = null;
+  }, [requireCleanPoseForCapture, saveShot]);
+
+  const deleteShot = useCallback(() => {
+    if (!shotSelect) return;
+    setShots((prev) => prev.filter((shot) => shot.name !== shotSelect));
+  }, [shotSelect]);
+
+  const previewShot = useCallback(() => {
+    const shot = shots.find((s) => s.name === shotSelect);
+    if (!shot) return;
+    setCameraRequest({ position: shot.a.position, target: shot.a.target, duration: 0.6 });
+  }, [shots, shotSelect]);
+
+  const copyShotsFile = useCallback(async () => {
+    const body =
+      `// Pegar reemplazando el contenido de src/shots.js\n` +
+      `export const SHOTS = ${JSON.stringify(shots, null, 2)};\n\n` +
+      `export const CINEMATIC_CONFIG = ${JSON.stringify(
+        {
+          lidDuration: lidDurationSec,
+          shotDuration: shotDurationSec,
+          lidStart: CINEMATIC_CONFIG.lidStart,
+          lidEnd: CINEMATIC_CONFIG.lidEnd,
+          lidEase: CINEMATIC_CONFIG.lidEase,
+          shotEase: CINEMATIC_CONFIG.shotEase,
+        },
+        null,
+        2
+      )};\n`;
+    try {
+      await navigator.clipboard.writeText(body);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = body;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
+    window.alert('shots.js copiado al portapapeles. Pegalo reemplazando src/shots.js.');
+  }, [shots, lidDurationSec, shotDurationSec]);
+
+  cinematicActionsRef.current = {
+    captureA,
+    captureBAndSave,
+    captureStatic,
+    deleteShot,
+    previewShot,
+    copyShotsFile,
+  };
+
+  // lidStart/lidEnd/lidEase son fijos (CINEMATIC_CONFIG, ya no editables
+  // desde Leva -- ver pedido de dejar solo la duracion); lidDuration y
+  // shotDuration si son sliders en vivo. shotDuration se aplica UNIFORME a
+  // todas las tomas dentro de CinematicRig (no cada toma trae la suya).
+  const cinematicRuntimeConfig = useMemo(
+    () => ({
+      lidDuration: lidDurationSec,
+      shotDuration: shotDurationSec,
+      lidStart: CINEMATIC_CONFIG.lidStart,
+      lidEnd: CINEMATIC_CONFIG.lidEnd,
+      lidEase: CINEMATIC_CONFIG.lidEase,
+      shotEase: CINEMATIC_CONFIG.shotEase,
+    }),
+    [lidDurationSec, shotDurationSec]
+  );
+
+  const onCinematicShotChange = useCallback(
+    (shot) => {
+      if (shot?.focus) setFocus(shot.focus);
+    },
+    [setFocus]
+  );
+
+  // Activacion/desactivacion del modo cinematico. Al activarse: guarda un
+  // snapshot de todo lo que la cinematica va a pisar (rotacion, lid, fov,
+  // focus) para poder devolverlo intacto al apagar, fuerza el modelo a
+  // rotacion 0 (arranque consistente, nunca "donde haya quedado") y prende
+  // autoRotate manteniendo la velocidad que ya estaba en el slider. Al
+  // desactivarse restaura ese snapshot y pide un refit de camara (fov real +
+  // encuadre) via `refitToken`, porque CinematicRig mutó camera.fov/position
+  // por fuera del ciclo normal de React.
+  useEffect(() => {
+    if (cinematicActive && !prevCinematicActiveRef.current) {
+      preCinematicSnapshotRef.current = {
+        modelRotationY,
+        autoRotate,
+        autoRotateSpeed,
+        lidAngle,
+        focus: { dofEnabled, focusDistance, focusRange, bokehScale, bloomEnabled, bloomIntensity, bloomThreshold },
+      };
+      lidAngleRef.current = CINEMATIC_CONFIG.lidStart;
+      setModel({ modelRotationY: 0, autoRotate: true });
+      setRotationResetKey((k) => k + 1);
+    } else if (!cinematicActive && prevCinematicActiveRef.current) {
+      const snap = preCinematicSnapshotRef.current;
+      if (snap) {
+        setModel({
+          modelRotationY: snap.modelRotationY,
+          autoRotate: snap.autoRotate,
+          autoRotateSpeed: snap.autoRotateSpeed,
+          lidAngle: snap.lidAngle,
+        });
+        setFocus(snap.focus);
+      }
+      setRefitToken((k) => k + 1);
+    }
+    prevCinematicActiveRef.current = cinematicActive;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cinematicActive]);
 
   const applyCameraPreset = useCallback(
     (preset) => {
@@ -627,7 +794,7 @@ export default function App() {
     [setFocus]
   );
 
-  applyPresetsRef.current = { material: applyMaterialPreset, camera: applyCameraPreset };
+  applyPresetsRef.current = { camera: applyCameraPreset };
 
   const exportingRef = useRef(false);
 
@@ -645,101 +812,6 @@ export default function App() {
     }
   }, [format, quality, resolution, transparentBg]);
   handleExportRef.current = handleExport;
-
-  const handleCopyConfig = useCallback(async () => {
-    // Agrupado por folder del panel para que el JSON quede legible y facil
-    // de pegar de vuelta en MATERIAL_PRESETS/CAMERA_PRESETS si hace falta.
-    const config = {
-      camera: { view, zoomMargin, fov },
-      screen: {
-        screenMesh,
-        reflectionIntensity,
-        reflectionRoughness,
-        imperfectionEnabled,
-        fingerprintTiling,
-        fingerprintOpacity,
-        fingerprintRoughnessAmount,
-        fingerprintMetalnessAmount,
-        fingerprintNormalIntensity,
-        vignetteRadius,
-        vignetteIntensity,
-      },
-      design: { imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness },
-      model: { modelRotationY, lidAngle, autoRotate, autoRotateSpeed },
-      metal: { metalTiling, metalRoughnessAmount, metalMetalnessAmount, metalNormalIntensity },
-      environment: { envPreset, envIntensity, bgColor, envAsBackground, blur, envRotationY },
-      focus: { dofEnabled, focusDistance, focusRange, bokehScale, bloomEnabled, bloomIntensity, bloomThreshold },
-      shadow: { shadowEnabled, shadowOpacity, shadowBlur, shadowScale },
-      export: { format, quality, resolution, transparentBg },
-    };
-    const json = JSON.stringify(config, null, 2);
-
-    try {
-      await navigator.clipboard.writeText(json);
-    } catch {
-      // Fallback para contextos sin permiso/API de clipboard (ej. http no
-      // localhost): copia imperativa via textarea oculto + execCommand.
-      const textarea = document.createElement('textarea');
-      textarea.value = json;
-      textarea.style.position = 'fixed';
-      textarea.style.opacity = '0';
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-    }
-  }, [
-    view,
-    zoomMargin,
-    fov,
-    screenMesh,
-    reflectionIntensity,
-    reflectionRoughness,
-    imperfectionEnabled,
-    fingerprintTiling,
-    fingerprintOpacity,
-    fingerprintRoughnessAmount,
-    fingerprintMetalnessAmount,
-    fingerprintNormalIntensity,
-    vignetteRadius,
-    vignetteIntensity,
-    imgScaleX,
-    imgScaleY,
-    offsetX,
-    offsetY,
-    imgRotation,
-    brightness,
-    modelRotationY,
-    lidAngle,
-    autoRotate,
-    autoRotateSpeed,
-    metalTiling,
-    metalRoughnessAmount,
-    metalMetalnessAmount,
-    metalNormalIntensity,
-    envPreset,
-    envIntensity,
-    bgColor,
-    envAsBackground,
-    blur,
-    envRotationY,
-    dofEnabled,
-    focusDistance,
-    focusRange,
-    bokehScale,
-    bloomEnabled,
-    bloomIntensity,
-    bloomThreshold,
-    shadowEnabled,
-    shadowOpacity,
-    shadowBlur,
-    shadowScale,
-    format,
-    quality,
-    resolution,
-    transparentBg,
-  ]);
-  handleCopyConfigRef.current = handleCopyConfig;
 
   const imageTransform = useMemo(
     () => ({ scaleX: imgScaleX, scaleY: imgScaleY, offsetX, offsetY, rotation: imgRotation }),
@@ -823,7 +895,7 @@ export default function App() {
               de camino y la deja mal apuntada; sin animacion no hay ventana
               en la que eso pueda pasar. */}
           <Bounds fit observe margin={zoomMargin} maxDuration={0}>
-            <ViewController view={view} zoomMargin={zoomMargin} fov={fov} />
+            <ViewController view={view} zoomMargin={zoomMargin} fov={fov} refitToken={refitToken} />
             <Center top>
               <Macbook
                 screenMeshName={screenMesh}
@@ -833,6 +905,8 @@ export default function App() {
                 brightness={brightness}
                 modelRotationY={modelRotationY}
                 lidAngle={lidAngle}
+                lidAngleRef={cinematicActive ? lidAngleRef : undefined}
+                rotationResetKey={rotationResetKey}
                 reflectionIntensity={reflectionIntensity}
                 reflectionRoughness={reflectionRoughness}
                 metalTiling={metalTiling}
@@ -886,7 +960,21 @@ export default function App() {
             maxDistance={15}
           />
 
-          <CameraPresetRig request={cameraRequest} orbitRef={orbitRef} />
+          {/* Desactivado (request=null) durante la cinematica: CinematicRig
+              ya escribe camera.position/lookAt cada frame, y este tween
+              pelearia por la misma camara si un preset viejo quedara
+              pendiente de una interaccion anterior al toggle. */}
+          <CameraPresetRig request={cinematicActive ? null : cameraRequest} orbitRef={orbitRef} />
+
+          <CinematicRig
+            active={cinematicActive}
+            shots={shots}
+            config={cinematicRuntimeConfig}
+            orbitRef={orbitRef}
+            lidAngleRef={lidAngleRef}
+            onShotChange={onCinematicShotChange}
+            registerCinematicApi={registerCinematicApi}
+          />
 
           <PostFXAutoClearGuard />
 

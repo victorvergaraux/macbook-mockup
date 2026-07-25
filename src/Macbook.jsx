@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
 import { useFrame, useLoader, useThree } from '@react-three/fiber';
-import modelUrl from '../src/macbook/source/macbook_pro_14_inch_M5.glb?url';
+import modelUrl from '../src/macbook/source/mackbook.glb?url';
 import metalRoughnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Roughness.jpg?url';
 import metalMetalnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Metallic.jpg?url';
 import metalNormalUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Normal.png?url';
@@ -13,29 +13,26 @@ import fingerprintOpacityMapUrl from '../src/macbook/PBR/imperfection_0002_opaci
 
 useGLTF.preload(modelUrl);
 
-// Nombres de mesh de este GLB especifico (hasheados, sin semantica legible en
-// el archivo). Se identificaron una sola vez inspeccionando el bounding box
-// local de cada mesh: la tapa (pantalla + bisel + camara) queda claramente
-// separada del cuerpo base en el eje que despues de la rotacion/escala raiz
-// del glTF se convierte en "altura" mundial (~9.8-19.7 vs ~-1..0.5 del resto).
-const LID_MESH_NAMES = [
-  'tfTbkkzhxqpKRgC', // pantalla (emissive)
-  'nAIWMiVEtSYdjdZ',
-  'QSjoCOCzvxPnLpK',
-  'JNlPAPsywCtwJrd',
-  'LQtuXuSGFKsUXjP',
-  'KjpcUkkMjGYeXkV',
-  'xiLiwJHfkqIwaTs',
-  'XodVrcYKiUPGCmX', // camara/notch (parte superior del bisel)
-  'MwJmMcLbTBwQpxl',
-  'LBeBZdkKmrJVhJd',
-  'OCxZAMeEkQKexHA',
-  'eFpSjyrDhTgtyuf',
-];
-// Barra de bisagra: mesh delgado que abarca todo el ancho, justo en el
-// limite entre tapa y base. Se usa como marcador para ubicar el pivote de
-// rotacion (mas confiable que calcular una coordenada fija a mano).
-const HINGE_MESH_NAME = 'WyuoVWKMOcOlXJM';
+// Este GLB (a diferencia del anterior) ya viene con la tapa separada del
+// cuerpo como dos nodos raiz distintos exportados desde Blender: "screen" y
+// "base". El nodo "screen" ya trae su propio pivot horneado exactamente
+// sobre el eje de la bisagra (verificado inspeccionando el archivo: el
+// centro del nodo cae a ~0.002 unidades del centro real del cilindro de
+// bisagra) -- ya no hace falta reconstruir un pivot en runtime reparentando
+// meshes sueltos por nombre hash, como exigia el modelo anterior.
+const SCREEN_NODE_NAME = 'screen';
+
+// El modelo viene 10x mas grande en unidades de mundo que el anterior (el
+// anterior traia scale=0.01 horneado en la raiz; este no trae escala). Se
+// compensa aqui en vez de retocar camaras/luces/presets/Cinematic.jsx, que
+// asumen el tamano de mundo del modelo viejo.
+const MODEL_SCALE = 0.1;
+
+// Nombre del material del "vidrio" horneado en el asset sobre el panel de
+// pantalla (ver comentario donde se usa, mas abajo): el codigo ya genera su
+// propio vidrio procedural controlable desde Leva, asi que este se oculta
+// para no duplicar la capa.
+const BAKED_GLASS_MATERIAL_NAME = 'ZtrFkpzRROyZncn';
 
 function hasColorMap(material) {
   const mats = Array.isArray(material) ? material : [material];
@@ -168,24 +165,8 @@ function buildPlaceholderScreenTexture() {
   return texture;
 }
 
-function buildLidPivot(clonedScene) {
-  clonedScene.updateMatrixWorld(true);
-
-  const hingeMesh = clonedScene.getObjectByName(HINGE_MESH_NAME);
-  const lidMeshes = LID_MESH_NAMES.map((name) => clonedScene.getObjectByName(name)).filter(Boolean);
-  if (!hingeMesh || !lidMeshes.length) return null;
-
-  const hingeCenterWorld = new THREE.Box3().setFromObject(hingeMesh).getCenter(new THREE.Vector3());
-  const pivotLocal = clonedScene.worldToLocal(hingeCenterWorld.clone());
-
-  const pivot = new THREE.Group();
-  pivot.name = '__lidPivot';
-  pivot.position.copy(pivotLocal);
-  clonedScene.add(pivot);
-
-  lidMeshes.forEach((mesh) => pivot.attach(mesh));
-
-  return pivot;
+function findLidPivot(clonedScene) {
+  return clonedScene.getObjectByName(SCREEN_NODE_NAME) ?? null;
 }
 
 export default function Macbook({
@@ -196,6 +177,8 @@ export default function Macbook({
   brightness,
   modelRotationY,
   lidAngle,
+  lidAngleRef,
+  rotationResetKey,
   reflectionIntensity,
   reflectionRoughness,
   metalTiling,
@@ -226,6 +209,7 @@ export default function Macbook({
   const lidPivotRef = useRef(null);
   const glassMeshRef = useRef(null);
   const glassMaterialRef = useRef(null);
+  const bakedGlassMeshRef = useRef(null);
   const vignetteAlphaTextureRef = useRef(null);
   const placeholderTextureRef = useRef(null);
   // Todo mesh que alguna vez fue "la pantalla" (seleccion manual via el
@@ -320,17 +304,37 @@ export default function Macbook({
 
   // Arma el pivote de bisagra una sola vez por instancia de clonedScene.
   useEffect(() => {
-    lidPivotRef.current = buildLidPivot(clonedScene);
+    lidPivotRef.current = findLidPivot(clonedScene);
   }, [clonedScene]);
 
   // Angulo de apertura/cierre: delta en grados sobre la pose original del
   // GLB (0 = pose tal cual viene el modelo; negativo cierra, positivo abre
   // mas). Se usa delta en vez de un angulo absoluto porque no conocemos el
   // angulo real de bisagra horneado en el asset.
+  //
+  // useFrame (no useEffect): la cinematica necesita animar este angulo a
+  // 60fps via CinematicRig, que escribe en `lidAngleRef.current` de forma
+  // imperativa -- un useEffect solo corre cuando cambian sus deps de React,
+  // nunca por una mutacion de ref. Cuando no hay cinematica activa,
+  // `lidAngleRef` esta ausente/null y se usa directo el slider `lidAngle` de
+  // Leva, igual que antes.
+  useFrame(() => {
+    const pivot = lidPivotRef.current;
+    if (!pivot) return;
+    const deg = lidAngleRef?.current ?? lidAngle ?? 0;
+    pivot.rotation.x = THREE.MathUtils.degToRad(deg);
+  });
+
+  // Reset de rotacion al arrancar la cinematica: `rotationResetKey` es un
+  // contador que App incrementa cada vez que se activa el toggle. autoRotate
+  // acumula en un ref (no en estado de React, ver useFrame de rotacion mas
+  // abajo) precisamente para no reflejar la rotacion en cada frame -- por
+  // eso hace falta este efecto aparte para forzarlo a 0 en vez de simplemente
+  // cambiar una prop.
   useEffect(() => {
-    if (!lidPivotRef.current) return;
-    lidPivotRef.current.rotation.x = THREE.MathUtils.degToRad(lidAngle ?? 0);
-  }, [lidAngle]);
+    if (rotationResetKey === undefined) return;
+    autoAngleRef.current = 0;
+  }, [rotationResetKey]);
 
   // Resuelve el mesh de pantalla activo segun seleccion manual o auto-guess.
   useEffect(() => {
@@ -423,6 +427,26 @@ export default function Macbook({
       glassMesh.renderOrder = 1;
       target.parent.add(glassMesh);
       glassMeshRef.current = glassMesh;
+
+      // El asset trae su propio mesh de "vidrio" horneado sobre el panel
+      // (material BAKED_GLASS_MATERIAL_NAME), hermano de la pantalla bajo el
+      // mismo padre. El vidrio procedural de arriba ya cubre ese rol (con
+      // controles de Leva de reflejo/huellas), asi que se oculta para no
+      // duplicar la capa ni arriesgar z-fighting con dos planos casi
+      // coincidentes. Se restaura visible primero por si el mesh de pantalla
+      // cambio (dropdown "mesh") y el nuevo `target.parent` no es el mismo
+      // nodo -- sin este reset, el vidrio horneado del "screen" original
+      // quedaria oculto para siempre aunque ya no aplique.
+      if (bakedGlassMeshRef.current) bakedGlassMeshRef.current.visible = true;
+      bakedGlassMeshRef.current = null;
+      target.parent.children.forEach((sibling) => {
+        if (sibling === target || !sibling.isMesh) return;
+        const mats = Array.isArray(sibling.material) ? sibling.material : [sibling.material];
+        if (mats.some((m) => m?.name === BAKED_GLASS_MATERIAL_NAME)) {
+          sibling.visible = false;
+          bakedGlassMeshRef.current = sibling;
+        }
+      });
     }
   }, [clonedScene, screenMeshName]);
 
@@ -492,6 +516,10 @@ export default function Macbook({
   //   parent que la pantalla, o sea que clonedScene.traverse tambien lo
   //   recorre -- sin esta exclusion, su material quedaba pisado con los
   //   mapas/valores del metal del chasis.
+  // - BAKED_GLASS_MATERIAL_NAME: el vidrio horneado del asset (ver efecto de
+  //   resolucion de pantalla mas arriba, donde se oculta) tampoco debe
+  //   recibir mapas de aluminio cepillado -- aunque quede invisible, sigue
+  //   siendo parte del arbol y este traverse lo alcanzaria igual.
   // mat.__pbrApplied evita reprocesar el mismo material compartido si el
   // efecto corre mas de una vez (ej. modo estricto de React). Los tres mapas
   // son la misma instancia de textura siempre (wrap/repeat nativo, ver
@@ -500,6 +528,7 @@ export default function Macbook({
     clonedScene.traverse((child) => {
       if (!child.isMesh || usedScreenMeshesRef.current.has(child) || child === glassMeshRef.current) return;
       const mats = Array.isArray(child.material) ? child.material : [child.material];
+      if (mats.some((m) => m?.name === BAKED_GLASS_MATERIAL_NAME)) return;
       mats.forEach((mat) => {
         if (!mat) return;
         if (!mat.__pbrApplied) {
@@ -671,7 +700,13 @@ export default function Macbook({
 
   return (
     <group ref={groupRef} {...props}>
-      <primitive object={clonedScene} />
+      {/* MODEL_SCALE compensa el x10 de escala de este GLB respecto al
+          anterior -- aislado en un group interno para que la rotacion
+          Y de arriba (auto-rotate + "rotation y" manual) siga aplicando
+          sobre el group externo sin verse afectada por el escalado. */}
+      <group scale={MODEL_SCALE}>
+        <primitive object={clonedScene} />
+      </group>
     </group>
   );
 }
