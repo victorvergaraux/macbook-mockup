@@ -393,7 +393,11 @@ export default function Macbook({
           color: 0xffffff,
           transparent: true,
           opacity: fingerprintOpacity ?? 0.45,
-          roughness: fingerprintRoughnessAmount ?? 0.4,
+          roughness: THREE.MathUtils.clamp(
+            (reflectionRoughness ?? 0.08) + (imperfectionEnabled ? fingerprintRoughnessAmount ?? 0.4 : 0),
+            0,
+            1
+          ),
           normalScale: new THREE.Vector2(
             fingerprintNormalIntensity ?? 0.6,
             fingerprintNormalIntensity ?? 0.6
@@ -523,15 +527,30 @@ export default function Macbook({
 
   // Ajustes en vivo de la capa de vidrio/huellas (el material ya existe,
   // creado en el efecto de resolucion de pantalla de arriba).
+  //
+  // roughness base: reflectionRoughness es quien de verdad controla el blur
+  // del reflejo (roughness gobierna la nitidez del lobulo IBL principal;
+  // clearcoatRoughness, mas abajo, solo blurea una capa de brillo fina
+  // encima y por si sola es casi imperceptible). fingerprintRoughnessAmount
+  // suma rugosidad EXTRA encima de esa base solo cuando las huellas estan
+  // activas (huellas = vidrio mas sucio = reflejo mas blureado todavia).
   useEffect(() => {
     const glassMat = glassMaterialRef.current;
     if (!glassMat) return;
+    const fingerprintExtra = imperfectionEnabled ? fingerprintRoughnessAmount ?? 0.4 : 0;
     glassMat.opacity = fingerprintOpacity ?? 0.45;
-    glassMat.roughness = fingerprintRoughnessAmount ?? 0.4;
+    glassMat.roughness = THREE.MathUtils.clamp((reflectionRoughness ?? 0.08) + fingerprintExtra, 0, 1);
     glassMat.normalScale.set(fingerprintNormalIntensity ?? 0.6, fingerprintNormalIntensity ?? 0.6);
     glassMat.metalness = fingerprintMetalnessAmount ?? 0.35;
     glassMat.needsUpdate = true;
-  }, [fingerprintOpacity, fingerprintRoughnessAmount, fingerprintNormalIntensity, fingerprintMetalnessAmount]);
+  }, [
+    fingerprintOpacity,
+    fingerprintRoughnessAmount,
+    fingerprintNormalIntensity,
+    fingerprintMetalnessAmount,
+    reflectionRoughness,
+    imperfectionEnabled,
+  ]);
 
   // Aplica la textura subida + transform (scale/offset/rotation) + brillo.
   useEffect(() => {
@@ -595,16 +614,31 @@ export default function Macbook({
   // reasignar scene.environment (cambio de preset) despues de que este
   // efecto ya corrio, y el orden de efectos entre componentes hermanos no
   // esta garantizado.
+  //
+  // envMapRotation se sincroniza por la misma razon Y porque es necesario:
+  // WebGLRenderer solo usa scene.environmentRotation (el slider "hdri
+  // rotation" de App.jsx) cuando material.envMap === null (asignacion
+  // implicita). En cuanto un material trae envMap explicito -- como este,
+  // asignado arriba a mano -- el renderer ignora scene.environmentRotation
+  // por completo y usa material.envMapRotation (propio del material, cero
+  // por defecto). Sin este copy, el reflejo de pantalla queda congelado en
+  // rotacion 0 aunque el fondo/iluminacion SI giren.
   useFrame(() => {
     const mat = screenMaterialRef.current;
-    if (mat && mat.envMap !== r3fScene.environment) {
-      mat.envMap = r3fScene.environment;
-      mat.needsUpdate = true;
+    if (mat) {
+      if (mat.envMap !== r3fScene.environment) {
+        mat.envMap = r3fScene.environment;
+        mat.needsUpdate = true;
+      }
+      mat.envMapRotation.copy(r3fScene.environmentRotation);
     }
     const glassMat = glassMaterialRef.current;
-    if (glassMat && glassMat.envMap !== r3fScene.environment) {
-      glassMat.envMap = r3fScene.environment;
-      glassMat.needsUpdate = true;
+    if (glassMat) {
+      if (glassMat.envMap !== r3fScene.environment) {
+        glassMat.envMap = r3fScene.environment;
+        glassMat.needsUpdate = true;
+      }
+      glassMat.envMapRotation.copy(r3fScene.environmentRotation);
     }
   });
 
