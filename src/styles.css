@@ -91,6 +91,12 @@ html, body, #root {
   line-height: 1.4;
 }
 
+.hud-error {
+  margin-top: 6px;
+  color: #b3261e;
+  font-weight: 600;
+}
+
 .loading-screen {
   position: fixed;
   inset: 0;

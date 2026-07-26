@@ -9,7 +9,13 @@ export function useScreenTexture(file) {
   const [texture, setTexture] = useState(null);
 
   useEffect(() => {
-    if (!file) return undefined;
+    if (!file) {
+      setTexture((prev) => {
+        prev?.dispose();
+        return null;
+      });
+      return undefined;
+    }
 
     let disposed = false;
     const url = URL.createObjectURL(file);

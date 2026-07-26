@@ -13,11 +13,22 @@ import { EffectComposer, DepthOfField, Bloom, Vignette } from '@react-three/post
 import { useControls, button, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
+import { useScreenVideoTexture } from './useScreenVideoTexture.js';
 import { exportCanvas } from './exporter.js';
 import { CinematicRig } from './Cinematic.jsx';
 import { SHOTS, CINEMATIC_CONFIG } from './shots.js';
 
 const ENV_PRESETS = ['studio', 'city', 'sunset', 'dawn', 'warehouse', 'apartment', 'forest', 'lobby'];
+
+// Leva registra `folderSettings.render` UNA SOLA VEZ (la primera llamada que
+// crea el path del folder) y nunca la vuelve a leer del closure de React.
+// Con StrictMode, el render inicial de React se ejecuta dos veces y la
+// invocacion descartada puede ser la que gana ese registro -- un useRef
+// dentro del componente no sirve porque cada pase de StrictMode crea su
+// propio ref. Una variable de modulo si es la misma celda para ambos pases,
+// asi que el predicate siempre lee el valor mas reciente sin importar cual
+// pase "gano" el registro en Leva.
+let isVideoFlag = false;
 
 // Direcciones normalizadas de camara por vista; Bounds calcula la distancia real
 // (fit) segun el tamano del modelo, aqui solo definimos el angulo.
@@ -211,12 +222,17 @@ function BackgroundController({ envAsBackground, bgColor }) {
 }
 
 /** Vive dentro del <Canvas>: expone gl y ejecuta la captura de export a alta resolucion. */
-function CaptureRig({ registerCapture }) {
+function CaptureRig({ registerCapture, videoEl }) {
   const { gl, size, scene, camera } = useThree();
 
   useEffect(() => {
     registerCapture({
       capture: async ({ format, quality, resolution, filename, transparent }) => {
+        // Con video corriendo el frame puede avanzar entre el render y el
+        // toDataURL; se pausa durante la captura para que no salga partido.
+        const wasPlaying = videoEl && !videoEl.paused;
+        if (wasPlaying) videoEl.pause();
+
         const basePR = gl.getPixelRatio();
         const targetPR = Math.min(basePR * resolution, 8);
         gl.setPixelRatio(targetPR);
@@ -246,9 +262,11 @@ function CaptureRig({ registerCapture }) {
         gl.setPixelRatio(basePR);
         gl.setSize(size.width, size.height, false);
         await waitFrames(1);
+
+        if (wasPlaying) videoEl.play().catch(() => {});
       },
     });
-  }, [gl, size, scene, camera, registerCapture]);
+  }, [gl, size, scene, camera, registerCapture, videoEl]);
 
   return null;
 }
@@ -296,7 +314,15 @@ export default function App() {
   const orbitRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  const screenTexture = useScreenTexture(screenFile);
+  const isVideo = useMemo(() => !!screenFile?.type.startsWith('video/'), [screenFile]);
+
+  // Solo uno de los dos recibe el File: el otro recibe null y limpia sus
+  // recursos (blob URL, textura) via su propio cleanup.
+  const imageTexture = useScreenTexture(isVideo ? null : screenFile);
+  const { texture: videoTexture, video: videoEl, error: videoError } =
+    useScreenVideoTexture(isVideo ? screenFile : null);
+
+  const screenTexture = isVideo ? videoTexture : imageTexture;
 
   const handleMeshList = useCallback((names, guessed) => {
     const opts = { auto: 'auto' };
@@ -370,6 +396,48 @@ export default function App() {
     }),
     { collapsed: true }
   );
+
+  isVideoFlag = isVideo;
+
+  // Controles solo tienen efecto visible cuando hay un video cargado
+  // (isVideo): sin sentido para una imagen estatica.
+  const [{ playing, playbackRate, muted }, setVideoControls] = useControls(
+    'Video',
+    () => ({
+      playing: { value: true, label: 'playing' },
+      playbackRate: { value: 1, min: 0.25, max: 2, step: 0.05, label: 'speed' },
+      // Desmutear puede bloquear el autoplay al recargar (politica del
+      // navegador de gestos de usuario), por eso el default queda en true.
+      muted: { value: true, label: 'muted (desmutear puede bloquear autoplay)' },
+    }),
+    { collapsed: true, render: () => isVideoFlag }
+  );
+
+  // El panel de Leva solo recalcula que folders mostrar cuando su store
+  // interno cambia de estado (ver el subscribe a getVisiblePaths en
+  // leva.esm.js). Mutar isVideoFlag no dispara eso por si solo, asi que se
+  // fuerza un set trivial (mismo valor) en cada cambio de isVideo para que
+  // Leva vuelva a evaluar `render` con el flag ya actualizado.
+  useEffect(() => {
+    setVideoControls({ muted });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isVideo]);
+
+  useEffect(() => {
+    if (!videoEl) return;
+    if (playing) videoEl.play().catch(() => {});
+    else videoEl.pause();
+  }, [videoEl, playing]);
+
+  useEffect(() => {
+    if (!videoEl) return;
+    videoEl.playbackRate = playbackRate;
+  }, [videoEl, playbackRate]);
+
+  useEffect(() => {
+    if (!videoEl) return;
+    videoEl.muted = muted;
+  }, [videoEl, muted]);
 
   // autoRotate gira el modelo (grupo de Macbook), no la camara/OrbitControls:
   // asi el usuario puede seguir orbitando la camara libremente sin pisar la
@@ -824,7 +892,7 @@ export default function App() {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file && file.type.startsWith('image/')) setScreenFile(file);
+    if (file && (file.type.startsWith('image/') || file.type.startsWith('video/'))) setScreenFile(file);
   }, []);
 
   const onDragOver = useCallback((e) => {
@@ -855,28 +923,29 @@ export default function App() {
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
         <div className="hud-sub">
-          Arrastra una imagen sobre la escena o usa el boton para cargarla en la pantalla.
+          Arrastra una imagen o video sobre la escena o usa el boton para cargarlo en la pantalla.
           <br />
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
             style={{ marginTop: 6, cursor: 'pointer' }}
           >
-            Cargar imagen
+            Cargar imagen o video
           </button>
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept="image/*,video/mp4,video/webm"
             onChange={onFileInputChange}
             style={{ display: 'none' }}
           />
+          {videoError && <div className="hud-error">{videoError}</div>}
         </div>
       </div>
 
       {isDragging && (
         <div className="dropzone-overlay active">
-          <div className="dropzone-card">Suelta la imagen para aplicarla en la pantalla</div>
+          <div className="dropzone-card">Suelta la imagen o video para aplicarlo en la pantalla</div>
         </div>
       )}
 
@@ -1009,7 +1078,7 @@ export default function App() {
             </EffectComposer>
           )}
 
-          <CaptureRig registerCapture={registerCapture} />
+          <CaptureRig registerCapture={registerCapture} videoEl={videoEl} />
         </Canvas>
       </div>
     </div>
