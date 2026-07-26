@@ -667,6 +667,7 @@ export default function App() {
       shotSelect: { value: shots[0]?.name ?? '', options: cinematicShotOptions, label: 'shots' },
       'Preview shot': button(() => cinematicActionsRef.current.previewShot?.()),
       'Delete shot': button(() => cinematicActionsRef.current.deleteShot?.()),
+      'Delete all shots': button(() => cinematicActionsRef.current.deleteAllShots?.()),
       'Copy shots.js': button(() => cinematicActionsRef.current.copyShotsFile?.()),
     }),
     { collapsed: true },
@@ -740,6 +741,22 @@ export default function App() {
     setShots((prev) => prev.filter((shot) => shot.name !== shotSelect));
   }, [shotSelect]);
 
+  // Destructivo (borra todas las tomas capturadas) -- confirmar antes, mismo
+  // criterio que el resto de la app para acciones que no se pueden deshacer.
+  const deleteAllShots = useCallback(() => {
+    if (!shots.length) return;
+    const label = shots.length === 1 ? 'la toma capturada' : `las ${shots.length} tomas capturadas`;
+    if (!window.confirm(`Borrar ${label}? Esta accion no se puede deshacer.`)) return;
+    pendingPoseARef.current = null;
+    // No hace falta resetear shotSelect a mano: cinematicShotOptions cae a
+    // '(sin tomas)' apenas shots.length llega a 0, y esta en el array de
+    // deps del useControls de mas abajo -- eso ya recrea el schema completo
+    // con el default correcto (mismo mecanismo que usa 'Delete shot' con una
+    // sola toma). Forzar el set a mano acá compite en el mismo tick con las
+    // opciones viejas y Leva lo rechaza (ValueError en consola).
+    setShots([]);
+  }, [shots]);
+
   const previewShot = useCallback(() => {
     const shot = shots.find((s) => s.name === shotSelect);
     if (!shot) return;
@@ -782,6 +799,7 @@ export default function App() {
     captureBAndSave,
     captureStatic,
     deleteShot,
+    deleteAllShots,
     previewShot,
     copyShotsFile,
   };
