@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
-import { Color, Vector3 } from 'three';
+import {
+  Color,
+  Vector3,
+  AgXToneMapping,
+  ACESFilmicToneMapping,
+  NeutralToneMapping,
+} from 'three';
 import {
   OrbitControls,
   Environment,
@@ -9,12 +15,22 @@ import {
   Bounds,
   useBounds,
 } from '@react-three/drei';
-import { EffectComposer, DepthOfField, Bloom, Vignette } from '@react-three/postprocessing';
+import {
+  EffectComposer,
+  DepthOfField,
+  Bloom,
+  Vignette,
+  N8AO,
+  BrightnessContrast,
+  Noise,
+} from '@react-three/postprocessing';
+import { BlendFunction } from 'postprocessing';
 import { useControls, button, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { useScreenVideoTexture } from './useScreenVideoTexture.js';
 import { exportCanvas } from './exporter.js';
+import ExportPanel, { ASPECT_PRESETS } from './ExportPanel.jsx';
 import { CinematicRig } from './Cinematic.jsx';
 import { SHOTS, CINEMATIC_CONFIG } from './shots.js';
 
@@ -221,22 +237,60 @@ function BackgroundController({ envAsBackground, bgColor }) {
   return null;
 }
 
-/** Vive dentro del <Canvas>: expone gl y ejecuta la captura de export a alta resolucion. */
+/** Tone mapping nativo del renderer (no el efecto ToneMapping de la lib
+ * "postprocessing"): asi `toneMappingExposure` funciona como se espera
+ * (se aplica dentro del shader de cada material antes de la curva, ver
+ * chunk tonemapping_fragment de three) sin arriesgar un doble tone-map si
+ * ademas se montara el efecto de post. R3F deja `ACESFilmicToneMapping` por
+ * defecto en el <Canvas> sin forma de configurarlo via prop declarativo que
+ * seguisimos usando (el prop `gl` solo acepta el objeto de contexto WebGL,
+ * no toneMapping); se fuerza aqui en cada cambio de control de Leva. */
+function ToneMappingController({ mode, exposure }) {
+  const { gl } = useThree();
+  useEffect(() => {
+    gl.toneMapping = mode;
+    gl.toneMappingExposure = exposure;
+  }, [gl, mode, exposure]);
+  return null;
+}
+
+/** Vive dentro del <Canvas>: expone gl y ejecuta la captura de export.
+ * "Escala real" = el mismo encuadre que se ve en pantalla, sin multiplicador
+ * manual -- pero el <Canvas> limita el pixel ratio a `dpr={[1,2]}` (App.jsx)
+ * por costo de interactividad, no por calidad deseada. Para el export (una
+ * operacion puntual, no cada frame) no aplica esa razon: se sube el pixel
+ * ratio al nativo real de la pantalla (`window.devicePixelRatio`, sin el
+ * tope de 2) solo durante la captura, y se restaura despues. Asi los bordes
+ * salen tan nitidos como el dispositivo puede dar, sin agregar un selector
+ * de resolucion manual en la UI. El recorte a un aspect ratio especifico
+ * (1:1, 9:16, etc.) se aplica despues, sobre esa misma captura de alta
+ * resolucion, en exporter.js -- nunca hace upscale, solo recorta. */
 function CaptureRig({ registerCapture, videoEl }) {
   const { gl, size, scene, camera } = useThree();
 
   useEffect(() => {
     registerCapture({
-      capture: async ({ format, quality, resolution, filename, transparent }) => {
+      capture: async ({ format, quality, filename, transparent, aspect }) => {
         // Con video corriendo el frame puede avanzar entre el render y el
         // toDataURL; se pausa durante la captura para que no salga partido.
         const wasPlaying = videoEl && !videoEl.paused;
         if (wasPlaying) videoEl.pause();
 
+        // x2 sobre el nativo (no solo igualarlo): en una pantalla de 2x
+        // (la mas comun), el dpr en pantalla ya toca el tope [1,2] del
+        // <Canvas>, asi que igualar devicePixelRatio no ganaria nada -- el
+        // x2 es supersampling real (mas muestras que las que el propio
+        // display necesita), que es lo que de verdad afila los bordes en
+        // el archivo exportado. Tope en 4: mas alla de eso el tamano de
+        // textura crece cuadratico sin aporte visible y arriesga superar
+        // gl.capabilities.maxTextureSize en pantallas 4K+/de escalado alto.
         const basePR = gl.getPixelRatio();
-        const targetPR = Math.min(basePR * resolution, 8);
-        gl.setPixelRatio(targetPR);
-        gl.setSize(size.width, size.height, false);
+        const targetPR = Math.min((window.devicePixelRatio || basePR) * 2, 4);
+        const boosted = targetPR > basePR;
+        if (boosted) {
+          gl.setPixelRatio(targetPR);
+          gl.setSize(size.width, size.height, false);
+        }
 
         if (transparent) {
           // Captura imperativa directa: evita depender del timing de React
@@ -250,17 +304,19 @@ function CaptureRig({ registerCapture, videoEl }) {
           gl.setClearAlpha(0);
           gl.clear(true, true, true);
           gl.render(scene, camera);
-          exportCanvas(gl.domElement, { format, quality, filename });
+          exportCanvas(gl.domElement, { format, quality, filename, aspect });
           scene.background = prevBackground;
           gl.autoClear = baseAutoClear;
           gl.setClearAlpha(baseAlpha);
         } else {
           await waitFrames(3);
-          exportCanvas(gl.domElement, { format, quality, filename });
+          exportCanvas(gl.domElement, { format, quality, filename, aspect });
         }
 
-        gl.setPixelRatio(basePR);
-        gl.setSize(size.width, size.height, false);
+        if (boosted) {
+          gl.setPixelRatio(basePR);
+          gl.setSize(size.width, size.height, false);
+        }
         await waitFrames(1);
 
         if (wasPlaying) videoEl.play().catch(() => {});
@@ -352,9 +408,8 @@ export default function App() {
 
   // Botones de presets. El schema se arma una sola vez (useMemo sin deps) y
   // cada boton lee la version mas reciente de applyCameraPreset a traves de
-  // un ref (mismo patron que handleExportRef mas abajo), ya que esa funcion
-  // depende de los `set` de otros useControls definidos despues en el
-  // componente.
+  // un ref, ya que esa funcion depende de los `set` de otros useControls
+  // definidos despues en el componente.
   const applyPresetsRef = useRef({ camera: () => {} });
 
   const cameraPresetSchema = useMemo(
@@ -387,8 +442,8 @@ export default function App() {
   const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useControls(
     'Design',
     () => ({
-      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'width' },
-      imgScaleY: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'height' },
+      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.5, label: 'width' },
+      imgScaleY: { value: 1, min: 0.1, max: 3, step: 0.5, label: 'height' },
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
       offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
@@ -447,7 +502,10 @@ export default function App() {
   // modelRotationY=0 + autoRotate=true al activarse y restaurar los valores
   // previos al desactivarse (ver activacion/desactivacion de `cinematicActive`
   // mas abajo).
-  const [{ modelRotationY, lidAngle, autoRotate, autoRotateSpeed }, setModel] = useControls(
+  const [
+    { modelRotationY, lidAngle, autoRotate, autoRotateSpeed, rotateSway, rotateRange },
+    setModel,
+  ] = useControls(
     'Model',
     () => ({
       modelRotationY: { value: 0, min: -180, max: 180, step: 1, label: 'rotation y' },
@@ -458,6 +516,14 @@ export default function App() {
       lidAngle: { value: -20, min: -20, max: 90, step: 1, label: 'lid angle' },
       autoRotate: { value: false, label: 'auto rotate' },
       autoRotateSpeed: { value: 0.05, min: -0.2, max: 0.2, step: 0.01, label: 'rotate speed' },
+      // Paneo tipo pendulo en vez de giro de 360 sin fin: evita que en una
+      // toma cinematografica el modelo termine "de espaldas" o fuera de
+      // camara mientras completa la vuelta (ver Macbook.jsx, useFrame de
+      // auto-rotacion). Default true: es el comportamiento deseado para
+      // cinematica: el giro de 360 sin fin (sway off) queda como opcion
+      // manual, no como default.
+      rotateSway: { value: true, label: 'sway' },
+      rotateRange: { value: 30, min: 5, max: 40, step: 1, label: 'pan range' },
     }),
     { collapsed: false }
   );
@@ -550,6 +616,66 @@ export default function App() {
     { collapsed: true }
   );
 
+  // Ambient occlusion por pantalla (N8AO): oscurece recovecos de contacto
+  // (teclas, bisagra, ranuras) que el IBL solo nunca produce.
+  const [{ aoEnabled, aoIntensity, aoRadius, aoDistanceFalloff }, setAO] = useControls(
+    'AO',
+    () => ({
+      aoEnabled: { value: true, label: 'enabled' },
+      aoIntensity: { value: 3, min: 0, max: 10, step: 0.1, label: 'intensity' },
+      aoRadius: { value: 0.4, min: 0.01, max: 2, step: 0.01, label: 'radius' },
+      aoDistanceFalloff: { value: 0.5, min: 0.01, max: 2, step: 0.01, label: 'falloff' },
+    }),
+    { collapsed: true }
+  );
+
+  // Grado de color final: tone mapping del renderer + viñeta + toques de
+  // grano/color que rompen la limpieza sintetica del CGI.
+  const [
+    {
+      toneMappingMode,
+      exposure,
+      vignetteOffset,
+      vignetteDarkness,
+      grainEnabled,
+      grainOpacity,
+      colorBrightness,
+      colorContrast,
+    },
+    setGrade,
+  ] = useControls(
+    'Grade',
+    () => ({
+      toneMappingMode: {
+        value: 'agx',
+        options: { AgX: 'agx', 'ACES Filmic': 'aces', Neutral: 'neutral' },
+        label: 'tone map',
+      },
+      exposure: { value: 1, min: 0.1, max: 3, step: 0.05, label: 'exposure' },
+      vignetteOffset: { value: 0.15, min: 0, max: 1, step: 0.01, label: 'vignette offset' },
+      vignetteDarkness: { value: 0.5, min: 0, max: 1, step: 0.01, label: 'vignette darkness' },
+      grainEnabled: { value: false, label: 'grain' },
+      grainOpacity: { value: 0.02, min: 0, max: 0.2, step: 0.005, label: 'grain amount' },
+      colorBrightness: { value: 0, min: -1, max: 1, step: 0.01, label: 'brightness' },
+      colorContrast: { value: 0, min: -1, max: 1, step: 0.01, label: 'contrast' },
+      // No hay control de "hue"/"saturation" (HueSaturation de postprocessing)
+      // a proposito: ver comentario junto al EffectComposer, mas abajo --
+      // fusionar BrightnessContrast + HueSaturation + Vignette (3+ efectos
+      // no-convolucion en un mismo EffectPass) produce un bug real de la lib
+      // "postprocessing" (artefacto visual tipo "marching ants" en la
+      // silueta del portatil). Con solo BrightnessContrast + Vignette (2
+      // efectos) queda limpio; se prioriza brightness/contrast sobre
+      // hue/saturation por ser el ajuste de grado mas usado.
+    }),
+    { collapsed: true }
+  );
+
+  const toneMappingThree = useMemo(() => {
+    if (toneMappingMode === 'aces') return ACESFilmicToneMapping;
+    if (toneMappingMode === 'neutral') return NeutralToneMapping;
+    return AgXToneMapping;
+  }, [toneMappingMode]);
+
   // Toggle visible (a diferencia del resto de ajustes finos de sombra, mas
   // abajo, que quedan ocultos del panel).
   const { shadowEnabled } = useControls(
@@ -570,22 +696,22 @@ export default function App() {
     { render: () => false }
   );
 
-  // Leva registra el callback de `button` una sola vez: usamos un ref para
-  // que siempre invoque la version mas reciente de handleExport (evita
-  // closures obsoletos con el resto de controles, ej. transparentBg).
-  const handleExportRef = useRef(() => {});
-
-  const { format, quality, resolution, transparentBg } = useControls(
+  // El export ya no vive en Leva: es un panel propio en DOM (ExportPanel,
+  // esquina inferior izquierda -- ver JSX mas abajo). Leva solo conserva un
+  // toggle para ocultarlo por completo.
+  const { hideExportUI } = useControls(
     'Export',
     {
-      format: { value: 'png', options: ['png', 'jpg'] },
-      quality: { value: 0.95, min: 0.5, max: 1, step: 0.01 },
-      resolution: { value: 2, options: { '1x': 1, '2x': 2, '4x': 4 } },
-      transparentBg: { value: false, label: 'transparent bg' },
-      'Export image': button(() => handleExportRef.current()),
+      hideExportUI: { value: false, label: 'hide UI' },
     },
-    { render: () => false }
+    { collapsed: true }
   );
+
+  const [exportFormat, setExportFormat] = useState('png');
+  const [exportQuality, setExportQuality] = useState(1);
+  const [exportTransparentBg, setExportTransparentBg] = useState(false);
+  const [exportAspect, setExportAspect] = useState('real');
+  const [isExporting, setIsExporting] = useState(false);
 
   // ---- Cinematica ----
   // Tomas guardadas: arrancan desde src/shots.js (la fuente de verdad
@@ -882,22 +1008,25 @@ export default function App() {
 
   applyPresetsRef.current = { camera: applyCameraPreset };
 
-  const exportingRef = useRef(false);
-
   const handleExport = useCallback(async () => {
-    if (!captureApiRef.current || exportingRef.current) return;
-    exportingRef.current = true;
+    if (!captureApiRef.current || isExporting) return;
+    setIsExporting(true);
     try {
-      const wantTransparent = transparentBg && format === 'png';
+      const wantTransparent = exportTransparentBg && exportFormat === 'png';
+      const preset = ASPECT_PRESETS.find((p) => p.id === exportAspect);
       // La captura transparente oculta fondo/postprocesado de forma
       // imperativa dentro de CaptureRig (ver App.jsx CaptureRig.capture),
       // asi que aqui no hace falta orquestar estado de React para eso.
-      await captureApiRef.current.capture({ format, quality, resolution, transparent: wantTransparent });
+      await captureApiRef.current.capture({
+        format: exportFormat,
+        quality: exportQuality,
+        transparent: wantTransparent,
+        aspect: preset?.ratio ?? null,
+      });
     } finally {
-      exportingRef.current = false;
+      setIsExporting(false);
     }
-  }, [format, quality, resolution, transparentBg]);
-  handleExportRef.current = handleExport;
+  }, [exportFormat, exportQuality, exportTransparentBg, exportAspect, isExporting]);
 
   const imageTransform = useMemo(
     () => ({ scaleX: imgScaleX, scaleY: imgScaleY, offsetX, offsetY, rotation: imgRotation }),
@@ -967,6 +1096,21 @@ export default function App() {
         </div>
       )}
 
+      {!hideExportUI && (
+        <ExportPanel
+          aspect={exportAspect}
+          onAspectChange={setExportAspect}
+          format={exportFormat}
+          onFormatChange={setExportFormat}
+          quality={exportQuality}
+          onQualityChange={setExportQuality}
+          transparentBg={exportTransparentBg}
+          onTransparentBgChange={setExportTransparentBg}
+          onExport={handleExport}
+          exporting={isExporting}
+        />
+      )}
+
       <div className="canvas-wrap">
         <Canvas
           camera={{ position: VIEW_PRESETS.iso, near: 0.1, far: 20, fov }}
@@ -1010,6 +1154,8 @@ export default function App() {
                 imperfectionEnabled={imperfectionEnabled}
                 autoRotate={autoRotate}
                 autoRotateSpeed={autoRotateSpeed}
+                rotateSway={rotateSway}
+                rotateRange={rotateRange}
                 wireframe={wireframe}
               />
             </Center>
@@ -1038,6 +1184,8 @@ export default function App() {
 
           <BackgroundController envAsBackground={envAsBackground} bgColor={bgColor} />
 
+          <ToneMappingController mode={toneMappingThree} exposure={exposure} />
+
           <OrbitControls
             ref={orbitRef}
             makeDefault
@@ -1065,36 +1213,78 @@ export default function App() {
 
           <PostFXAutoClearGuard />
 
-          {(dofEnabled || bloomEnabled) && (
-            // multisampling>0: cuando el composer esta montado (bloom/dof
-            // activos), renderiza a un render target offscreen que salta el
-            // antialias nativo del canvas -- sin esto, gl.antialias no hace
-            // nada visible mientras el composer este activo. Se desactiva
-            // (0) cuando dof esta on porque DepthOfField ya difumina la
-            // imagen (el MSAA extra no aporta) y ahorra el pase de resolve.
-            //
-            // Con dof activo, Chrome/ANGLE en Windows puede loguear
-            // "GL_INVALID_OPERATION: glBlitFramebuffer: read and write
-            // depth stencil attachments cannot be the same image" -- es un
-            // bug conocido de la lib "postprocessing" al crear su textura de
-            // profundidad interna para el pase de DepthOfField (ver
-            // pmndrs/postprocessing issues). No afecta el render (verificado
-            // visualmente); no hay fix limpio sin parchear la libreria.
-            <EffectComposer key={`${dofEnabled}|${bloomEnabled}`} multisampling={dofEnabled ? 0 : 4}>
-              {dofEnabled ? (
-                <DepthOfField
-                  focusDistance={focusDistance}
-                  focusRange={focusRange}
-                  bokehScale={bokehScale}
-                  height={480}
-                />
-              ) : null}
-              {bloomEnabled ? (
-                <Bloom luminanceThreshold={bloomThreshold} luminanceSmoothing={0.3} intensity={bloomIntensity} mipmapBlur />
-              ) : null}
-              <Vignette eskil={false} offset={0.15} darkness={0.5} />
-            </EffectComposer>
-          )}
+          {/* El composer queda SIEMPRE montado (antes solo existia con
+              bloom/dof activos): con el viejo `(dofEnabled || bloomEnabled) &&`
+              apagar ambos hacia desaparecer de golpe la vinieta/grano/AO sin
+              que nada en el panel lo explicara -- ahora cada efecto se
+              condiciona por separado y el composer en si nunca se desmonta.
+              multisampling: 4 normalmente (suple el antialias nativo del
+              canvas, que el render target offscreen del composer salta), 0
+              cuando dof esta on (DepthOfField ya difumina la imagen, el MSAA
+              extra no aporta y ahorra el pase de resolve).
+              key: fuerza remount cuando cambia cualquier toggle que altera
+              la topologia de pases (AO, grano) -- evita estados a medio
+              aplicar de la lib "postprocessing" al agregar/quitar efectos
+              en caliente.
+
+              DOS bugs reales de la lib "postprocessing" encontrados y
+              evitados aqui (no son suposiciones -- cada uno se aislo
+              probando combinaciones A/B en pantalla, quitando un efecto a
+              la vez):
+
+              1) NO hay <SMAA/> a proposito. Se probo como reemplazo de AA
+                 (item 4.4 del roadmap) pero genera un borde punteado
+                 blanco/negro tipo "marching ants" en la silueta del
+                 portatil contra el fondo. Aparece con SMAA solo (sin
+                 ningun otro efecto), con cualquier combinacion de
+                 AO/bloom/vignette/color, y con TODOS los SMAAPreset
+                 (LOW/MEDIUM/HIGH/ULTRA) y EdgeDetectionMode (COLOR/LUMA)
+                 probados. `multisampling={dofEnabled?0:4}` sin SMAA es la
+                 unica via de antialiasing que queda limpia -- no
+                 reintroducir SMAA sin resolver esto primero.
+
+              2) NO hay control de HueSaturation (ver folder Grade, mas
+                 arriba) a proposito. La lib fusiona automaticamente todo
+                 grupo de Effects no-convolucion consecutivos en un unico
+                 EffectPass (shader concatenado). Con 2 efectos fusionados
+                 (BrightnessContrast+Vignette, o HueSaturation+Vignette) el
+                 render queda limpio; con 3 (BrightnessContrast+
+                 HueSaturation+Vignette) reaparece el mismo artefacto de
+                 "marching ants" de (1). Se prioriza brightness/contraste
+                 sobre hue/saturacion y se deja solo el par de 2 efectos. Si
+                 se agrega CUALQUIER otro efecto no-convolucion a este grupo
+                 (Vignette+BrightnessContrast), volver a probar A/B con zoom
+                 cerrado sobre un borde de alto contraste (ej. zoomMargin
+                 0.3-0.4 en el folder Camera) antes de asumir que esta bien. */}
+          <EffectComposer
+            key={`${dofEnabled}|${bloomEnabled}|${aoEnabled}|${grainEnabled}`}
+            multisampling={dofEnabled ? 0 : 4}
+          >
+            {aoEnabled ? (
+              <N8AO
+                aoRadius={aoRadius}
+                distanceFalloff={aoDistanceFalloff}
+                intensity={aoIntensity}
+                quality="high"
+              />
+            ) : null}
+            {dofEnabled ? (
+              <DepthOfField
+                focusDistance={focusDistance}
+                focusRange={focusRange}
+                bokehScale={bokehScale}
+                height={480}
+              />
+            ) : null}
+            {bloomEnabled ? (
+              <Bloom luminanceThreshold={bloomThreshold} luminanceSmoothing={0.3} intensity={bloomIntensity} mipmapBlur />
+            ) : null}
+            <BrightnessContrast brightness={colorBrightness} contrast={colorContrast} />
+            <Vignette eskil={false} offset={vignetteOffset} darkness={vignetteDarkness} />
+            {grainEnabled ? (
+              <Noise premultiply blendFunction={BlendFunction.OVERLAY} opacity={grainOpacity} />
+            ) : null}
+          </EffectComposer>
 
           <CaptureRig registerCapture={registerCapture} videoEl={videoEl} />
         </Canvas>

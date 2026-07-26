@@ -113,3 +113,107 @@ html, body, #root {
 .leva-container {
   z-index: 30 !important;
 }
+
+/* Panel de export: minimalista, sin sombras ni gradientes -- una pastilla
+   flotante abajo a la izquierda. border-radius 30rem es intencionalmente
+   mayor a la mitad de cualquier lado del panel, asi el navegador siempre
+   lo clampea a una capsula perfecta sin importar cuantos controles quepan
+   adentro (ver CSS spec de border-radius, clamping automatico). */
+.export-panel {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #1c1c1e;
+  border-radius: 30rem;
+  font-family: inherit;
+}
+
+.export-panel-select {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: #f2f2f2;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 8px;
+  border-radius: 30rem;
+  cursor: pointer;
+}
+
+.export-panel-select:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.export-panel-select:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.4);
+  outline-offset: -1px;
+}
+
+.export-panel-range {
+  width: 64px;
+  accent-color: #f2f2f2;
+}
+
+.export-panel-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: #a9a9ac;
+  cursor: pointer;
+}
+
+.export-panel-icon-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f2f2f2;
+}
+
+.export-panel-icon-btn.active {
+  color: #f2f2f2;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.export-panel-icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.export-panel-download-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: #f2f2f2;
+  color: #1c1c1e;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.export-panel-download-btn:hover:not(:disabled) {
+  background: #ffffff;
+}
+
+.export-panel-download-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.export-panel-spin {
+  animation: export-panel-spin 0.8s linear infinite;
+}
+
+@keyframes export-panel-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

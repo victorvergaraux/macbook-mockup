@@ -195,6 +195,8 @@ export default function Macbook({
   imperfectionEnabled,
   autoRotate,
   autoRotateSpeed,
+  rotateSway,
+  rotateRange,
   wireframe,
   ...props
 }) {
@@ -689,12 +691,24 @@ export default function Macbook({
   // un ref (no en estado de React) y se aplica imperativamente al grupo cada
   // frame, sumada al offset manual de "Model > rotation y". Asi orbitar la
   // camara con el mouse nunca interfiere con este giro ni al reves.
+  //
+  // "Sway" (paneo tipo pendulo): en vez de acumular la fase directo como angulo
+  // (giro de 360 sin fin), se usa como argumento de Math.sin -- la propia
+  // curva seno ya frena suavemente cerca de los extremos y acelera al
+  // cruzar el centro, que es exactamente el vaiven de pendulo que se busca
+  // (nunca "sale de camara" mostrando la nuca del portatil a mitad de una
+  // toma cinematografica). rotateRange es la amplitud en grados hacia cada
+  // lado desde el centro. autoRotateSpeed sigue siendo la misma velocidad
+  // de fase en ambos modos -- solo cambia como se interpreta esa fase.
   useFrame((_, delta) => {
     if (autoRotate) {
       autoAngleRef.current += delta * (autoRotateSpeed ?? 0.1);
     }
+    const swing = rotateSway
+      ? THREE.MathUtils.degToRad(rotateRange ?? 45) * Math.sin(autoAngleRef.current)
+      : autoAngleRef.current;
     if (groupRef.current) {
-      groupRef.current.rotation.y = THREE.MathUtils.degToRad(modelRotationY ?? 0) + autoAngleRef.current;
+      groupRef.current.rotation.y = THREE.MathUtils.degToRad(modelRotationY ?? 0) + swing;
     }
   });
 
