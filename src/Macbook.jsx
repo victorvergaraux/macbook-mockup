@@ -193,8 +193,6 @@ function getScreenAspect(mesh) {
 }
 
 export default function Macbook({
-  screenMeshName,
-  onMeshList,
   onScreenAspect,
   screenTexture,
   imageTransform,
@@ -312,15 +310,6 @@ export default function Macbook({
     });
   }, [fingerprintTiling, fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha]);
 
-  // Lista de meshes disponibles (para el selector Leva) + resolucion inicial.
-  useEffect(() => {
-    const names = [];
-    clonedScene.traverse((child) => {
-      if (child.isMesh) names.push(child.name);
-    });
-    onMeshList?.(names, guessScreenMesh(clonedScene)?.name ?? null);
-  }, [clonedScene, onMeshList]);
-
   // Nueva instancia de clonedScene (nuevo `scene.clone(true)`) invalida las
   // referencias de mesh anteriores: sin este reset, usedScreenMeshesRef
   // arrastraria objetos Mesh de una escena ya descartada.
@@ -362,15 +351,9 @@ export default function Macbook({
     autoAngleRef.current = 0;
   }, [rotationResetKey]);
 
-  // Resuelve el mesh de pantalla activo segun seleccion manual o auto-guess.
+  // Resuelve el mesh de pantalla activo (auto-guess, ver guessScreenMesh).
   useEffect(() => {
-    let target = null;
-    if (screenMeshName && screenMeshName !== 'auto') {
-      clonedScene.traverse((child) => {
-        if (child.isMesh && child.name === screenMeshName) target = child;
-      });
-    }
-    if (!target) target = guessScreenMesh(clonedScene);
+    const target = guessScreenMesh(clonedScene);
 
     if (target) {
       const aspect = getScreenAspect(target);
@@ -479,7 +462,7 @@ export default function Macbook({
         }
       });
     }
-  }, [clonedScene, screenMeshName, onScreenAspect]);
+  }, [clonedScene, onScreenAspect]);
 
   // Toggle "Fingerprint > enabled": con las huellas apagadas, el vidrio
   // queda uniforme (sin roughnessMap/normalMap/metalnessMap/alphaMap),
@@ -532,7 +515,6 @@ export default function Macbook({
     fingerprintTiling,
     vignetteRadius,
     vignetteIntensity,
-    screenMeshName,
   ]);
 
   // PBR realista para el chasis de aluminio: normal/roughness/metalness maps
@@ -576,7 +558,6 @@ export default function Macbook({
     });
   }, [
     clonedScene,
-    screenMeshName,
     metalNormal,
     metalRoughness,
     metalMetalness,
@@ -618,13 +599,29 @@ export default function Macbook({
     if (!mat) return;
 
     if (screenTexture) {
-      screenTexture.repeat.set(
-        1 / (imageTransform?.scaleX ?? 1),
-        1 / (imageTransform?.scaleY ?? 1)
-      );
+      const scaleX = imageTransform?.scaleX ?? 1;
+      const scaleY = imageTransform?.scaleY ?? 1;
+      const repeatX = 1 / scaleX;
+      const repeatY = 1 / scaleY;
+      screenTexture.repeat.set(repeatX, repeatY);
+      // La textura tiene `center=(0.5,0.5)` fijo (useScreenTexture.js /
+      // useScreenVideoTexture.js): three.js escala `repeat` alrededor de
+      // ese centro, no de la esquina -- sampledUV = repeat*(meshUV-0.5)
+      // + 0.5 + offset. Sin compensar, mover el slider width/height
+      // encogeria la imagen desde el centro (el usuario veria que se
+      // "recentra" en vez de encogerse desde arriba-izquierda). Sumando
+      // 0.5*(repeat-1) al offset se cancela ese pivote central y el punto
+      // sampledUV(meshUV=0)=offset (arriba-izquierda de la pantalla) queda
+      // fijo en 0 sin importar cuanto cambien width/height -- asi la
+      // imagen siempre se encoge/agranda desde la esquina, nunca desde el
+      // centro. offsetX/offsetY (los sliders "offset x/y") pasan a ser un
+      // PANEO relativo a ese anclaje: en 0 la imagen queda pegada
+      // arriba-izquierda; +/- la corre desde ahi, no desde el centro.
+      const anchorX = 0.5 * (repeatX - 1);
+      const anchorY = 0.5 * (repeatY - 1);
       screenTexture.offset.set(
-        imageTransform?.offsetX ?? 0,
-        imageTransform?.offsetY ?? 0
+        anchorX + (imageTransform?.offsetX ?? 0),
+        anchorY + (imageTransform?.offsetY ?? 0)
       );
       screenTexture.rotation = THREE.MathUtils.degToRad(imageTransform?.rotation ?? 0);
       // Anisotropy al maximo del GPU (no un valor fijo bajo): la pantalla se
@@ -721,7 +718,7 @@ export default function Macbook({
         if (mat) mat.wireframe = wireframe ?? false;
       });
     });
-  }, [clonedScene, wireframe, screenMeshName, imperfectionEnabled]);
+  }, [clonedScene, wireframe, imperfectionEnabled]);
 
   // Auto-rotacion del modelo, no de la camara/OrbitControls: se acumula en
   // un ref (no en estado de React) y se aplica imperativamente al grupo cada

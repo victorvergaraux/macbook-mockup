@@ -401,8 +401,6 @@ function CompositionGrid() {
 export default function App() {
   const [screenFile, setScreenFile] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [meshOptions, setMeshOptions] = useState({ auto: 'auto' });
-  const [autoGuessName, setAutoGuessName] = useState(null);
   const captureApiRef = useRef(null);
   const orbitRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -416,15 +414,6 @@ export default function App() {
     useScreenVideoTexture(isVideo ? screenFile : null);
 
   const screenTexture = isVideo ? videoTexture : imageTexture;
-
-  const handleMeshList = useCallback((names, guessed) => {
-    const opts = { auto: 'auto' };
-    names.forEach((n) => {
-      opts[n] = n;
-    });
-    setMeshOptions(opts);
-    setAutoGuessName(guessed);
-  }, []);
 
   // Aspecto real (ancho/alto) del mesh de pantalla activo, reportado desde
   // Macbook.jsx (ver getScreenAspect ahi) -- se recalcula solo cuando
@@ -468,13 +457,9 @@ export default function App() {
 
   const [cameraRequest, setCameraRequest] = useState(null);
 
-  const [
-    { screenMesh, reflectionIntensity, reflectionRoughness },
-    setScreenReflection,
-  ] = useControls(
+  const [{ reflectionIntensity, reflectionRoughness }, setScreenReflection] = useControls(
     'Screen',
     () => ({
-      screenMesh: { value: 'auto', options: meshOptions, label: 'mesh' },
       reflectionIntensity: { value: 0.4, min: 0, max: 1, step: 0.01, label: 'reflection' },
       reflectionRoughness: { value: 0.25, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
@@ -487,25 +472,25 @@ export default function App() {
   // efecto de auto-fit mas abajo, que sube este valor si hace falta en vez
   // de recortar el calculo al tope fijo de antes).
   const [scaleYMax, setScaleYMax] = useState(3);
-  // Idem para "offset y": con center=(0.5,0.5) fijo en la textura (ver
-  // efecto de auto-fit), anclar arriba-izquierda una imagen muy ANCHA (poca
-  // altura relativa) puede pedir un offsetY fuera de [-1,1].
-  const [offsetYBound, setOffsetYBound] = useState(1);
 
   // Design: la imagen que el usuario carga (no el efecto/hardware de la
-  // pantalla, eso vive en 'Screen' arriba).
+  // pantalla, eso vive en 'Screen' arriba). offsetX/offsetY son un PANEO
+  // relativo al anclaje arriba-izquierda (que Macbook.jsx garantiza
+  // siempre, para cualquier width/height -- ver comentario ahi junto al
+  // calculo de anchorX/anchorY): en 0 la imagen queda pegada arriba-
+  // izquierda sin importar cuanto se escale; +/- la corre desde ese punto.
   const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useControls(
     'Design',
     () => ({
       imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.25, label: 'width' },
       imgScaleY: { value: 1, min: 0.1, max: scaleYMax, step: 0.25, label: 'height' },
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
-      offsetY: { value: 0, min: -offsetYBound, max: offsetYBound, step: 0.01, label: 'offset y' },
+      offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
       brightness: { value: 1.7, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
     }),
     { collapsed: false },
-    [scaleYMax, offsetYBound]
+    [scaleYMax]
   );
 
   // Auto-ajuste al cargar imagen/video (o al cambiar de mesh de pantalla):
@@ -513,8 +498,10 @@ export default function App() {
   // width siempre = 1 (repeat.x=1 ya cubre el ancho completo de la
   // pantalla); height = screenAspect/imageAspect, que es exactamente el
   // factor que hace que la imagen ocupe su alto proporcional real sin
-  // deformarse. offsetX/offsetY en 0 ancla la imagen arriba-izquierda
-  // (mismo origen que usa el UV del modelo, ver useScreenTexture.js).
+  // deformarse. offsetX/offsetY en 0 = sin paneo extra (el anclaje
+  // arriba-izquierda ya lo garantiza Macbook.jsx para cualquier width/
+  // height, incluso si el usuario los sigue tocando despues -- por eso
+  // este efecto ya no necesita calcular ni compensar ningun offset).
   // Trade-off aceptado: si scaleY<1 (imagen mucho mas ancha que alta)
   // sobra alto de pantalla -- ClampToEdgeWrapping repite el ultimo pixel
   // de abajo en vez de dejar un hueco realmente vacio, pero no distorsiona
@@ -546,37 +533,15 @@ export default function App() {
       return;
     }
 
-    // La textura tiene `center=(0.5,0.5)` fijo (useScreenTexture.js /
-    // useScreenVideoTexture.js -- asi el zoom/rotacion MANUAL del usuario
-    // pivotea desde el centro, no la esquina). Eso significa que
-    // `repeat`/`offset` de three.js escalan alrededor de ese centro:
-    // sampledV = repeat.y*(meshV-0.5) + 0.5 + offsetY. Para que el TOPE del
-    // recorte visible arranque justo en meshV=0 (anclaje arriba, no
-    // centrado), offsetY no puede quedarse en 0 -- hay que resolver la
-    // ecuacion para sampledV(meshV=0)=0, lo que da offsetY =
-    // 0.5*(repeat.y-1) = 0.5*(1/scaleY - 1). Con scaleX siempre 1 esto da
-    // offsetX=0 (no hace falta correccion en X, coincide con lo esperado).
-    const clampedScaleY = Math.max(0.1, fitScaleY);
-    const topAnchorOffsetY = 0.5 * (1 / clampedScaleY - 1);
-
-    // Mismo mecanismo de expansion de rango que scaleYMax arriba, para el
-    // caso de imagenes muy anchas/cortas (offsetY negativo grande en valor
-    // absoluto -- ver derivacion en el comentario de arriba).
-    const requiredOffsetBound = Math.max(1, Math.ceil((Math.abs(topAnchorOffsetY) * 1.15) / 0.01) * 0.01);
-    if (requiredOffsetBound > offsetYBound) {
-      setOffsetYBound(requiredOffsetBound);
-      return;
-    }
-
     setDesign({
       imgScaleX: 1,
-      imgScaleY: clampedScaleY,
+      imgScaleY: Math.max(0.1, fitScaleY),
       offsetX: 0,
-      offsetY: topAnchorOffsetY,
+      offsetY: 0,
       imgRotation: 0,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [screenTexture, isVideo, screenAspect, scaleYMax, offsetYBound]);
+  }, [screenTexture, isVideo, screenAspect, scaleYMax]);
 
   isVideoFlag = isVideo;
 
@@ -1272,8 +1237,6 @@ export default function App() {
             <ViewController view={view} zoomMargin={zoomMargin} fov={fov} refitToken={refitToken} />
             <Center top>
               <Macbook
-                screenMeshName={screenMesh}
-                onMeshList={handleMeshList}
                 onScreenAspect={setScreenAspect}
                 screenTexture={screenTexture}
                 imageTransform={imageTransform}
