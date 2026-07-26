@@ -169,9 +169,33 @@ function findLidPivot(clonedScene) {
   return clonedScene.getObjectByName(SCREEN_NODE_NAME) ?? null;
 }
 
+/**
+ * Aspecto (ancho/alto) real del panel de pantalla, calculado desde el
+ * bounding box LOCAL de la geometria (child.geometry.boundingBox), no desde
+ * Box3().setFromObject() en espacio de mundo: la tapa abierta rota el mesh
+ * (pivot.rotation.x, ver useFrame de auto-rotacion mas abajo) e inflaria el
+ * AABB de mundo con cualquier angulo que no sea 0/90 -- el bounding box
+ * local de la geometria es invariante a esa rotacion.
+ * La bisagra rota sobre X (pivot.rotation.x), asi que el eje X local del
+ * panel es siempre el ancho (nunca se mezcla con la apertura); de los otros
+ * dos ejes, el mas grande es el alto visible del panel y el mas chico el
+ * espesor (profundidad) del vidrio/carcasa en esa zona.
+ */
+function getScreenAspect(mesh) {
+  if (!mesh?.geometry) return null;
+  if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+  const size = new THREE.Vector3();
+  mesh.geometry.boundingBox.getSize(size);
+  const width = size.x;
+  const height = Math.max(size.y, size.z);
+  if (!width || !height) return null;
+  return width / height;
+}
+
 export default function Macbook({
   screenMeshName,
   onMeshList,
+  onScreenAspect,
   screenTexture,
   imageTransform,
   brightness,
@@ -201,7 +225,7 @@ export default function Macbook({
   ...props
 }) {
   const { scene } = useGLTF(modelUrl);
-  const { scene: r3fScene } = useThree();
+  const { scene: r3fScene, gl } = useThree();
   const clonedScene = useMemo(() => scene.clone(true), [scene]);
   const groupRef = useRef(null);
   const autoAngleRef = useRef(0);
@@ -348,6 +372,11 @@ export default function Macbook({
     }
     if (!target) target = guessScreenMesh(clonedScene);
 
+    if (target) {
+      const aspect = getScreenAspect(target);
+      if (aspect) onScreenAspect?.(aspect);
+    }
+
     if (screenMeshRef.current && screenMeshRef.current !== target) {
       // restaura material original del mesh previo
       if (originalMaterialRef.current) {
@@ -450,7 +479,7 @@ export default function Macbook({
         }
       });
     }
-  }, [clonedScene, screenMeshName]);
+  }, [clonedScene, screenMeshName, onScreenAspect]);
 
   // Toggle "Fingerprint > enabled": con las huellas apagadas, el vidrio
   // queda uniforme (sin roughnessMap/normalMap/metalnessMap/alphaMap),
@@ -598,6 +627,13 @@ export default function Macbook({
         imageTransform?.offsetY ?? 0
       );
       screenTexture.rotation = THREE.MathUtils.degToRad(imageTransform?.rotation ?? 0);
+      // Anisotropy al maximo del GPU (no un valor fijo bajo): la pantalla se
+      // ve casi siempre en angulo (vistas iso), y ahi es donde el filtrado
+      // anisotropico marca la diferencia real -- ayuda a la nitidez del
+      // muestreo en angulo rasante, aunque no "inventa" resolucion que la
+      // imagen fuente no tenga (ver upscaleIfNeeded en useScreenTexture.js
+      // para eso). Costo: ninguno perceptible, es filtrado nativo del GPU.
+      screenTexture.anisotropy = gl.capabilities.getMaxAnisotropy();
       screenTexture.needsUpdate = true;
 
       mat.map = screenTexture;
@@ -620,7 +656,7 @@ export default function Macbook({
       mat.color = new THREE.Color(0xffffff);
     }
     mat.needsUpdate = true;
-  }, [screenTexture, imageTransform, brightness]);
+  }, [screenTexture, imageTransform, brightness, gl]);
 
   // Intensidad del reflejo (reflectivity de MeshBasicMaterial, 0-1) +
   // nitidez del reflejo del vidrio (clearcoatRoughness: 0 = espejo nitido,

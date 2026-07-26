@@ -30,6 +30,24 @@ export function useScreenVideoTexture(file) {
     video.playsInline = true;
     video.crossOrigin = 'anonymous';
     video.preload = 'auto';
+    // El elemento nunca se ve (solo se lee su frame para la VideoTexture),
+    // pero SI hay que insertarlo en el DOM: un <video> huerfano (creado con
+    // createElement y jamas montado) no tiene layout ni entra al arbol de
+    // render, y varios navegadores (Chrome incluido) tratan eso como "video
+    // en segundo plano" y le aplican throttling de energia -- la
+    // reproduccion se pausa sola pasado un rato aunque el codigo nunca la
+    // pause. display:none / visibility:hidden disparan la misma
+    // optimizacion (tampoco cuentan como "visible"); position:fixed +
+    // opacity casi-cero + tamano de 1px si cuenta como contenido renderizado
+    // real para el navegador y evita la pausa.
+    video.style.position = 'fixed';
+    video.style.left = '0';
+    video.style.top = '0';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0.01';
+    video.style.pointerEvents = 'none';
+    document.body.appendChild(video);
 
     const onReady = () => {
       if (disposed) return;
@@ -72,6 +90,7 @@ export function useScreenVideoTexture(file) {
       // Sin este reset el decoder sigue corriendo en background.
       video.removeAttribute('src');
       video.load();
+      video.remove();
       setState((prev) => {
         prev.texture?.dispose();
         return { texture: null, video: null, error: null };

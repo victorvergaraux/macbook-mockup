@@ -29,6 +29,7 @@ import { useControls, button, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { useScreenVideoTexture } from './useScreenVideoTexture.js';
+import { UploadCloud } from 'lucide-react';
 import { exportCanvas } from './exporter.js';
 import ExportPanel, { ASPECT_PRESETS } from './ExportPanel.jsx';
 import { CinematicRig } from './Cinematic.jsx';
@@ -351,14 +352,50 @@ function ViewController({ view, zoomMargin, fov, refitToken }) {
     // token el fov quedaria en el ultimo valor que dejo la ultima toma en
     // vez de volver al valor real del slider "fov" al salir del modo
     // cinematico.
-    bounds
-      .refresh()
-      .reset()
-      .to({ position: VIEW_PRESETS[view] ?? VIEW_PRESETS.iso, target: [0, 0, 0] })
-      .fit();
+    // OJO: no encadenar `.fit()` despues de `.to()` aqui. En drei, `fit()`
+    // para una camara perspectiva (no ortografica, nuestro caso) es
+    // literalmente un alias de `reset()` -- y `reset()` recalcula la
+    // direccion a partir de `camera.position` TAL CUAL ESTA en ese instante
+    // (la posicion real, todavia no animada), no de lo que `.to()` acaba de
+    // programar. Encadenarlos pisaba por completo el cambio de vista: el
+    // dropdown "view" no hacia nada notorio, solo reajustaba la distancia
+    // via zoomMargin mantieniendo el angulo de camara que hubiera quedado
+    // antes. Fix: calcular la posicion final a mano, usando la misma
+    // distancia que `fit()` habria usado (bounds.getSize().distance, que ya
+    // incorpora el margin/zoomMargin del <Bounds>), aplicada sobre la
+    // DIRECCION del preset -- eso reemplaza correctamente el `.reset().to().fit()`
+    // sin el bug de auto-cancelacion.
+    bounds.refresh();
+    const { center, distance } = bounds.getSize();
+    const direction = new Vector3(...(VIEW_PRESETS[view] ?? VIEW_PRESETS.iso)).normalize();
+    const position = center.clone().addScaledVector(direction, distance);
+    bounds.moveTo(position).lookAt({ target: center });
   }, [view, zoomMargin, fov, camera, bounds, refitToken]);
 
   return null;
+}
+
+/** Guia de encuadre en DOM (fuera del <Canvas>, no es geometria 3D): grid de
+ * tercios (3x3, las 4 lineas que dividen el cuadro en 9) mas una cruz
+ * central (las 2 lineas restantes, exactamente a la mitad) -- el overlay de
+ * composicion clasico de foto/cine. Se apoya sobre <div> con
+ * border dashed en vez de SVG: cada linea es un div de 0 alto/ancho
+ * posicionado en %, asi escala solo con el tamano real del contenedor sin
+ * logica de resize ni distorsion de viewBox. */
+function CompositionGrid() {
+  const thirds = ['33.333%', '66.666%'];
+  return (
+    <div className="composition-grid">
+      {thirds.map((pos) => (
+        <div key={`v-${pos}`} className="composition-grid-line-v" style={{ left: pos }} />
+      ))}
+      {thirds.map((pos) => (
+        <div key={`h-${pos}`} className="composition-grid-line-h" style={{ top: pos }} />
+      ))}
+      <div className="composition-grid-line-v composition-grid-center" style={{ left: '50%' }} />
+      <div className="composition-grid-line-h composition-grid-center" style={{ top: '50%' }} />
+    </div>
+  );
 }
 
 export default function App() {
@@ -389,6 +426,13 @@ export default function App() {
     setAutoGuessName(guessed);
   }, []);
 
+  // Aspecto real (ancho/alto) del mesh de pantalla activo, reportado desde
+  // Macbook.jsx (ver getScreenAspect ahi) -- se recalcula solo cuando
+  // cambia el mesh resuelto (auto-guess o seleccion manual), asi que sirve
+  // de base para el auto-ajuste de imagen/video de mas abajo sin importar
+  // si el disparador fue un archivo nuevo o un cambio de mesh.
+  const [screenAspect, setScreenAspect] = useState(16 / 10);
+
   const registerCapture = useCallback((api) => {
     captureApiRef.current = api;
   }, []);
@@ -401,7 +445,7 @@ export default function App() {
     {
       view: { value: 'iso', options: ['iso', 'isoLeft', 'frontal', 'top'] },
       zoomMargin: { value: 1.3, min: 0.3, max: 3, step: 0.05, label: 'framing' },
-      fov: { value: 18, min: 12, max: 45, step: 1, label: 'fov' },
+      fov: { value: 12, min: 12, max: 45, step: 1, label: 'fov' },
     },
     { collapsed: true }
   );
@@ -437,20 +481,102 @@ export default function App() {
     { collapsed: true }
   );
 
+  // Tope superior del slider "height" (imgScaleY): normalmente 3 alcanza,
+  // pero una imagen/video muy vertical (ej. 9:16) en una pantalla ancha
+  // (~16:10) puede necesitar mas para el ajuste automatico exacto (ver
+  // efecto de auto-fit mas abajo, que sube este valor si hace falta en vez
+  // de recortar el calculo al tope fijo de antes).
+  const [scaleYMax, setScaleYMax] = useState(3);
+  // Idem para "offset y": con center=(0.5,0.5) fijo en la textura (ver
+  // efecto de auto-fit), anclar arriba-izquierda una imagen muy ANCHA (poca
+  // altura relativa) puede pedir un offsetY fuera de [-1,1].
+  const [offsetYBound, setOffsetYBound] = useState(1);
+
   // Design: la imagen que el usuario carga (no el efecto/hardware de la
   // pantalla, eso vive en 'Screen' arriba).
   const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useControls(
     'Design',
     () => ({
-      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.5, label: 'width' },
-      imgScaleY: { value: 1, min: 0.1, max: 3, step: 0.5, label: 'height' },
+      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.25, label: 'width' },
+      imgScaleY: { value: 1, min: 0.1, max: scaleYMax, step: 0.25, label: 'height' },
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
-      offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
+      offsetY: { value: 0, min: -offsetYBound, max: offsetYBound, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
       brightness: { value: 1.7, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
     }),
-    { collapsed: true }
+    { collapsed: false },
+    [scaleYMax, offsetYBound]
   );
+
+  // Auto-ajuste al cargar imagen/video (o al cambiar de mesh de pantalla):
+  // "ajustar a lo ancho, escalar proporcionalmente en alto, top-left".
+  // width siempre = 1 (repeat.x=1 ya cubre el ancho completo de la
+  // pantalla); height = screenAspect/imageAspect, que es exactamente el
+  // factor que hace que la imagen ocupe su alto proporcional real sin
+  // deformarse. offsetX/offsetY en 0 ancla la imagen arriba-izquierda
+  // (mismo origen que usa el UV del modelo, ver useScreenTexture.js).
+  // Trade-off aceptado: si scaleY<1 (imagen mucho mas ancha que alta)
+  // sobra alto de pantalla -- ClampToEdgeWrapping repite el ultimo pixel
+  // de abajo en vez de dejar un hueco realmente vacio, pero no distorsiona
+  // nada, que es el problema que esto reemplaza. El usuario sigue pudiendo
+  // tocar los sliders despues para recortar/mover a mano; el calculo
+  // vuelve a correr entero en el proximo archivo que se cargue.
+  useEffect(() => {
+    if (!screenTexture) return;
+    const media = screenTexture.image;
+    if (!media) return;
+    const naturalW = isVideo ? media.videoWidth : media.width;
+    const naturalH = isVideo ? media.videoHeight : media.height;
+    if (!naturalW || !naturalH) return;
+
+    const imageAspect = naturalW / naturalH;
+    const fitScaleY = screenAspect / imageAspect;
+
+    // Si el slider "height" (imgScaleY) todavia no tiene rango suficiente
+    // para este valor, primero se expande el tope (scaleYMax) y se sale sin
+    // aplicar el fit -- Leva recorta cualquier `set()` al max ya REGISTRADO
+    // en el store, que solo se actualiza tras el proximo render con el
+    // nuevo scaleYMax (useControls reconstruye el schema por el 4to arg de
+    // deps `[scaleYMax]`). Este mismo efecto vuelve a correr solo porque
+    // scaleYMax esta en su propio array de deps, ya con rango suficiente
+    // para aplicar el valor real sin recorte.
+    const requiredMax = Math.max(3, Math.ceil((fitScaleY * 1.15) / 0.25) * 0.25);
+    if (requiredMax > scaleYMax) {
+      setScaleYMax(requiredMax);
+      return;
+    }
+
+    // La textura tiene `center=(0.5,0.5)` fijo (useScreenTexture.js /
+    // useScreenVideoTexture.js -- asi el zoom/rotacion MANUAL del usuario
+    // pivotea desde el centro, no la esquina). Eso significa que
+    // `repeat`/`offset` de three.js escalan alrededor de ese centro:
+    // sampledV = repeat.y*(meshV-0.5) + 0.5 + offsetY. Para que el TOPE del
+    // recorte visible arranque justo en meshV=0 (anclaje arriba, no
+    // centrado), offsetY no puede quedarse en 0 -- hay que resolver la
+    // ecuacion para sampledV(meshV=0)=0, lo que da offsetY =
+    // 0.5*(repeat.y-1) = 0.5*(1/scaleY - 1). Con scaleX siempre 1 esto da
+    // offsetX=0 (no hace falta correccion en X, coincide con lo esperado).
+    const clampedScaleY = Math.max(0.1, fitScaleY);
+    const topAnchorOffsetY = 0.5 * (1 / clampedScaleY - 1);
+
+    // Mismo mecanismo de expansion de rango que scaleYMax arriba, para el
+    // caso de imagenes muy anchas/cortas (offsetY negativo grande en valor
+    // absoluto -- ver derivacion en el comentario de arriba).
+    const requiredOffsetBound = Math.max(1, Math.ceil((Math.abs(topAnchorOffsetY) * 1.15) / 0.01) * 0.01);
+    if (requiredOffsetBound > offsetYBound) {
+      setOffsetYBound(requiredOffsetBound);
+      return;
+    }
+
+    setDesign({
+      imgScaleX: 1,
+      imgScaleY: clampedScaleY,
+      offsetX: 0,
+      offsetY: topAnchorOffsetY,
+      imgRotation: 0,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screenTexture, isVideo, screenAspect, scaleYMax, offsetYBound]);
 
   isVideoFlag = isVideo;
 
@@ -525,7 +651,7 @@ export default function App() {
       rotateSway: { value: true, label: 'sway' },
       rotateRange: { value: 30, min: 5, max: 40, step: 1, label: 'pan range' },
     }),
-    { collapsed: false }
+    { collapsed: true }
   );
 
   // Chassis brushed-metal texture (normal/roughness/metalness map).
@@ -767,12 +893,20 @@ export default function App() {
   // patron que el folder oculto 'Camera Presets' mas arriba) para ocultar el
   // panel sin afectar en nada la reproduccion, que siempre lee de `shots`.
   const [
-    { cinematicActive, lidDurationSec, shotDurationSec, shotSelect },
+    { cinematicActive, gridEnabled, lidDurationSec, shotDurationSec, shotSelect },
     setCinematic,
   ] = useControls(
     'Cinematic (Advanced)',
     () => ({
       cinematicActive: { value: false, label: 'active' },
+      // Guia de encuadre (grid de tercios + cruz central): se dibuja en DOM,
+      // fuera del <Canvas> (ver CompositionGrid mas abajo), y se oculta sola
+      // mientras cinematicActive este prendido -- no hace falta snapshot ni
+      // restore como con modelRotationY/autoRotate/etc mas abajo, porque el
+      // toggle en si nunca cambia de valor: solo se deriva su visibilidad
+      // (`gridEnabled && !cinematicActive`), asi que vuelve a aparecer sola
+      // al apagar la cinematica si seguia activada.
+      gridEnabled: { value: false, label: 'grid' },
       lidDurationSec: {
         value: CINEMATIC_CONFIG.lidDuration,
         min: 2,
@@ -1065,7 +1199,7 @@ export default function App() {
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
     >
-      <Leva collapsed={false} titleBar={{ title: 'Scene Controls' }} className="leva-container" />
+      <Leva collapsed={true} titleBar={{ title: 'Scene Controls' }} className="leva-container" />
 
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
@@ -1092,9 +1226,18 @@ export default function App() {
 
       {isDragging && (
         <div className="dropzone-overlay active">
-          <div className="dropzone-card">Suelta la imagen o video para aplicarlo en la pantalla</div>
+          <div className="dropzone-card">
+            <UploadCloud size={32} strokeWidth={1.5} />
+            <div className="dropzone-card-title">Suelta aquí</div>
+            <div className="dropzone-card-subtitle">Imagen o video para la pantalla</div>
+            <div className="dropzone-card-hint">
+              Recomendado: 2000px+ de ancho, relación 16:10
+            </div>
+          </div>
         </div>
       )}
+
+      {gridEnabled && !cinematicActive && <CompositionGrid />}
 
       {!hideExportUI && (
         <ExportPanel
@@ -1131,6 +1274,7 @@ export default function App() {
               <Macbook
                 screenMeshName={screenMesh}
                 onMeshList={handleMeshList}
+                onScreenAspect={setScreenAspect}
                 screenTexture={screenTexture}
                 imageTransform={imageTransform}
                 brightness={brightness}
