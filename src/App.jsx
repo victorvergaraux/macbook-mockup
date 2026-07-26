@@ -576,7 +576,7 @@ export default function App() {
     { cinematicActive, lidDurationSec, shotDurationSec, shotSelect },
     setCinematic,
   ] = useControls(
-    'Cinematic',
+    'Cinematic (Advanced)',
     () => ({
       cinematicActive: { value: false, label: 'active' },
       lidDurationSec: {
