@@ -25,7 +25,7 @@ import {
   Noise,
 } from '@react-three/postprocessing';
 import { BlendFunction } from 'postprocessing';
-import { useControls, button, Leva } from 'leva';
+import { useControls, button, buttonGroup, folder, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { useScreenVideoTexture } from './useScreenVideoTexture.js';
@@ -842,6 +842,21 @@ export default function App() {
   const preCinematicSnapshotRef = useRef(null);
   const prevCinematicActiveRef = useRef(false);
   const cinematicActionsRef = useRef({});
+  // Boton Play/Stop del panel Leva: mismo condicional `cinematicActive` de
+  // siempre (efectos de Cinematic.jsx, snapshot/restore, grid, etc. no
+  // cambian), solo que ahora vive en useState en vez de en el value de un
+  // control boolean de Leva -- asi el label del boton puede leer su propio
+  // valor actual (ver deps de useControls mas abajo, que fuerzan a Leva a
+  // regenerar el boton -- y por lo tanto su label -- cada vez que cambia).
+  const [cinematicActive, setCinematicActive] = useState(false);
+  // Panel Leva controlado: se compacta solo al arrancar la cinematica (para
+  // ver la escena sin controles al lado) pero se puede reabrir a mano en
+  // cualquier momento -- no se fuerza a re-expandir al parar, queda como el
+  // usuario lo haya dejado.
+  const [levaCollapsed, setLevaCollapsed] = useState(true);
+  useEffect(() => {
+    if (cinematicActive) setLevaCollapsed(true);
+  }, [cinematicActive]);
 
   const cinematicShotOptions = useMemo(() => {
     if (!shots.length) return { '(sin tomas)': '' };
@@ -858,46 +873,93 @@ export default function App() {
   // patron que el folder oculto 'Camera Presets' mas arriba) para ocultar el
   // panel sin afectar en nada la reproduccion, que siempre lee de `shots`.
   const [
-    { cinematicActive, gridEnabled, lidDurationSec, shotDurationSec, shotSelect },
+    { gridEnabled, lidDurationSec, shotDurationSec, shotSelect },
     setCinematic,
   ] = useControls(
     'Cinematic (Advanced)',
     () => ({
-      cinematicActive: { value: false, label: 'active' },
+      // Dos botones de KEY FIJA (nunca cambian) en vez de una key dinamica:
+      // Leva ordena las filas por el orden en que cada key se vio POR
+      // PRIMERA VEZ y nunca lo actualiza, asi que una key dinamica ('Play'
+      // <-> 'Stop') saltaba de fila cada click. Con key fija ambos botones
+      // quedan anclados arriba, en las primeras dos filas, para siempre.
+      // Cual de los dos se ve se resuelve fuera de Leva, por DOM (ver
+      // useEffect `syncPlayStopButtons` mas abajo) porque `render` por
+      // control tampoco esta soportado para botones en Leva (solo a nivel
+      // folder completo, como 'Camera Presets' mas abajo) -- confirmado
+      // inspeccionando el store de Leva en runtime.
+      '▶ Play': button(() => setCinematicActive(true)),
+      '■ Stop': button(() => setCinematicActive(false)),
       // Guia de encuadre (grid de tercios + cruz central): se dibuja en DOM,
       // fuera del <Canvas> (ver CompositionGrid mas abajo), y se oculta sola
       // mientras cinematicActive este prendido -- no hace falta snapshot ni
       // restore como con modelRotationY/autoRotate/etc mas abajo, porque el
       // toggle en si nunca cambia de valor: solo se deriva su visibilidad
       // (`gridEnabled && !cinematicActive`), asi que vuelve a aparecer sola
-      // al apagar la cinematica si seguia activada.
+      // al apagar la cinematica si seguia activada. Fuera de 'Playback' (key
+      // propia, top-level) para que quede pegado justo debajo de Play/Stop.
       gridEnabled: { value: false, label: 'grid' },
-      lidDurationSec: {
-        value: CINEMATIC_CONFIG.lidDuration,
-        min: 2,
-        max: 10,
-        step: 0.5,
-        label: 'lid duration (s)',
-      },
-      shotDurationSec: {
-        value: CINEMATIC_CONFIG.shotDuration,
-        min: 0.5,
-        max: 15,
-        step: 0.1,
-        label: 'shot duration (s)',
-      },
-      'Capture A': button(() => cinematicActionsRef.current.captureA?.()),
-      'Capture B + Save': button(() => cinematicActionsRef.current.captureBAndSave?.()),
-      'Capture static': button(() => cinematicActionsRef.current.captureStatic?.()),
-      shotSelect: { value: shots[0]?.name ?? '', options: cinematicShotOptions, label: 'shots' },
-      'Preview shot': button(() => cinematicActionsRef.current.previewShot?.()),
-      'Delete shot': button(() => cinematicActionsRef.current.deleteShot?.()),
-      'Delete all shots': button(() => cinematicActionsRef.current.deleteAllShots?.()),
-      'Copy shots.js': button(() => cinematicActionsRef.current.copyShotsFile?.()),
+      Playback: folder({
+        lidDurationSec: {
+          value: CINEMATIC_CONFIG.lidDuration,
+          min: 2,
+          max: 10,
+          step: 0.5,
+          label: 'lid duration (s)',
+        },
+        shotDurationSec: {
+          value: CINEMATIC_CONFIG.shotDuration,
+          min: 0.5,
+          max: 15,
+          step: 0.1,
+          label: 'shot duration (s)',
+        },
+      }),
+      'Shot Capture': folder({
+        Capture: buttonGroup({
+          A: () => cinematicActionsRef.current.captureA?.(),
+          'B + Save': () => cinematicActionsRef.current.captureBAndSave?.(),
+        }),
+        'Capture static': button(() => cinematicActionsRef.current.captureStatic?.()),
+        shotSelect: { value: shots[0]?.name ?? '', options: cinematicShotOptions, label: 'shots' },
+        'Preview shot': button(() => cinematicActionsRef.current.previewShot?.()),
+        'Delete shot': button(() => cinematicActionsRef.current.deleteShot?.()),
+        'Delete all shots': button(() => cinematicActionsRef.current.deleteAllShots?.()),
+        // Oculto temporalmente a pedido del usuario -- copyShotsFile sigue
+        // intacta en cinematicActionsRef (ver mas abajo), solo hace falta
+        // descomentar esta linea para volver a mostrar el boton. Si se
+        // reactiva, renombrar sin el punto literal ('Copy shots.js' choca
+        // con el separador de paths interno de Leva y genera una fila
+        // fantasma "Copy shots" agrupando un control ".js").
+        // 'Copy shots.js': button(() => cinematicActionsRef.current.copyShotsFile?.()),
+      }),
     }),
     { collapsed: true },
     [cinematicShotOptions]
   );
+
+  // Los botones Play/Stop de arriba tienen key fija (ver comentario en el
+  // schema): cual se ve se decide aca por DOM en vez de por Leva, porque
+  // Leva no soporta `render` condicional por control individual (solo por
+  // folder completo). MutationObserver porque el folder "Cinematic
+  // (Advanced)" arranca colapsado -- los botones no existen en el DOM hasta
+  // que el usuario lo abre, y hay que re-aplicar la visibilidad en ese
+  // momento, no solo al cambiar `cinematicActive`.
+  useEffect(() => {
+    const applyVisibility = () => {
+      document.querySelectorAll('button').forEach((btn) => {
+        if (btn.textContent === '▶ Play') {
+          btn.parentElement.style.display = cinematicActive ? 'none' : '';
+        } else if (btn.textContent === '■ Stop') {
+          btn.parentElement.style.display = cinematicActive ? '' : 'none';
+        }
+      });
+    };
+    applyVisibility();
+    const observer = new MutationObserver(applyVisibility);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [cinematicActive]);
 
   // Las tomas son poses absolutas de mundo (ver comentario en shots.js): si
   // se capturan con el modelo girado o autorrotando, la composicion no va a
@@ -1164,7 +1226,11 @@ export default function App() {
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
     >
-      <Leva collapsed={true} titleBar={{ title: 'Scene Controls' }} className="leva-container" />
+      <Leva
+        collapsed={{ collapsed: levaCollapsed, onChange: setLevaCollapsed }}
+        titleBar={{ title: 'Scene Controls' }}
+        className="leva-container"
+      />
 
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
