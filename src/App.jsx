@@ -1,12 +1,6 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
-import {
-  Color,
-  Vector3,
-  AgXToneMapping,
-  ACESFilmicToneMapping,
-  NeutralToneMapping,
-} from 'three';
+import { Color, Vector3 } from 'three';
 import {
   OrbitControls,
   Environment,
@@ -25,8 +19,9 @@ import {
   N8AO,
   BrightnessContrast,
   Noise,
+  ToneMapping,
 } from '@react-three/postprocessing';
-import { BlendFunction } from 'postprocessing';
+import { BlendFunction, ToneMappingMode } from 'postprocessing';
 import { useControls, button, buttonGroup, folder, Leva } from 'leva';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
@@ -297,20 +292,37 @@ function BackgroundController({ envAsBackground, bgColor }) {
   return null;
 }
 
-/** Tone mapping nativo del renderer (no el efecto ToneMapping de la lib
- * "postprocessing"): asi `toneMappingExposure` funciona como se espera
- * (se aplica dentro del shader de cada material antes de la curva, ver
- * chunk tonemapping_fragment de three) sin arriesgar un doble tone-map si
- * ademas se montara el efecto de post. R3F deja `ACESFilmicToneMapping` por
- * defecto en el <Canvas> sin forma de configurarlo via prop declarativo que
- * seguisimos usando (el prop `gl` solo acepta el objeto de contexto WebGL,
- * no toneMapping); se fuerza aqui en cada cambio de control de Leva. */
-function ToneMappingController({ mode, exposure }) {
+/** Exposure global: SOLO `gl.toneMappingExposure`, nunca `gl.toneMapping`.
+ *
+ * BUG REAL encontrado y verificado en runtime (no es una suposicion --
+ * confirmado con lectura de pixeles del canvas, comparando renders a
+ * exposure 0.15/1/3 y a los 3 modos de tonemap: salida IDENTICA byte a byte
+ * en todos los casos): `<EffectComposer>` de "@react-three/postprocessing"
+ * trae, en su propio codigo fuente (dist/EffectComposer.js), un
+ * `useEffect(() => { gl.toneMapping = NoToneMapping; ... }, [gl])` que se
+ * dispara apenas el composer monta -- y como el composer queda SIEMPRE
+ * montado en esta app (ver comentario grande junto al <EffectComposer> mas
+ * abajo), `gl.toneMapping` (el MODO: AgX/ACES/Neutral) queda forzado a
+ * "sin tonemap" para siempre. Asignarlo aca (como se hacia antes) no sirve
+ * de nada: el shader de cada material se compila sin la curva de tonemap
+ * sin importar que valor le pongamos.
+ *
+ * `gl.toneMappingExposure`, en cambio, SI sigue funcionando: three.js lo
+ * sube como uniforme en cada `refreshMaterial` (WebGLRenderer.js,
+ * `p_uniforms.setValue(_gl, 'toneMappingExposure', ...)`) de forma
+ * incondicional, sin importar el modo -- pero sin curva de tonemap activa
+ * (el shader nunca llama a la funcion `toneMapping()` porque el define
+ * TONE_MAPPING no se genera) ese uniforme no tiene ningun efecto visible
+ * sobre los materiales de la escena. Por eso el efecto real del exposure
+ * ahora lo aporta <ToneMapping> (el efecto de la propia lib "postprocessing",
+ * ver <EffectComposer> mas abajo), que SI aplica su propia curva -- y ese
+ * efecto lee este mismo uniforme `toneMappingExposure` para su multiplicador
+ * de exposicion, asi que seguimos necesitando esta funcion para subirlo. */
+function ToneMappingController({ exposure }) {
   const { gl } = useThree();
   useEffect(() => {
-    gl.toneMapping = mode;
     gl.toneMappingExposure = exposure;
-  }, [gl, mode, exposure]);
+  }, [gl, exposure]);
   return null;
 }
 
@@ -870,10 +882,14 @@ export default function App() {
     { collapsed: true }
   );
 
-  const toneMappingThree = useMemo(() => {
-    if (toneMappingMode === 'aces') return ACESFilmicToneMapping;
-    if (toneMappingMode === 'neutral') return NeutralToneMapping;
-    return AgXToneMapping;
+  // Modo para el efecto <ToneMapping> de la lib "postprocessing" (no las
+  // constantes de tonemap nativas de three.js -- ver comentario grande en
+  // ToneMappingController mas arriba sobre por que el modo nativo no sirve
+  // con el composer siempre montado).
+  const toneMappingEffectMode = useMemo(() => {
+    if (toneMappingMode === 'aces') return ToneMappingMode.ACES_FILMIC;
+    if (toneMappingMode === 'neutral') return ToneMappingMode.NEUTRAL;
+    return ToneMappingMode.AGX;
   }, [toneMappingMode]);
 
   // Toggle visible (a diferencia del resto de ajustes finos de sombra, mas
@@ -1533,7 +1549,7 @@ export default function App() {
 
           <BackgroundController envAsBackground={envAsBackground} bgColor={bgColor} />
 
-          <ToneMappingController mode={toneMappingThree} exposure={exposure} />
+          <ToneMappingController exposure={exposure} />
 
           <OrbitControls
             ref={orbitRef}
@@ -1610,7 +1626,20 @@ export default function App() {
                  se agrega CUALQUIER otro efecto no-convolucion a este grupo
                  (Vignette+BrightnessContrast), volver a probar A/B con zoom
                  cerrado sobre un borde de alto contraste (ej. zoomMargin
-                 0.3-0.4 en el folder Camera) antes de asumir que esta bien. */}
+                 0.3-0.4 en el folder Camera) antes de asumir que esta bien.
+
+              <ToneMapping> (mas abajo, justo despues de <Bloom>): agregado
+              porque el tonemap NATIVO del renderer (gl.toneMapping) no
+              tiene ningun efecto mientras este composer este montado -- ver
+              el comentario grande en ToneMappingController, App.jsx, con la
+              verificacion pixel a pixel que confirma el bug. Se probo A/B
+              con zoom cerrado en un borde de alto contraste (mismo
+              criterio que (1) y (2)) y no reproduce el artefacto de
+              "marching ants": queda en su PROPIO grupo de fusion, separado
+              del grupo BrightnessContrast+Vignette de (2) por <Bloom>
+              (que corta cualquier cadena de fusion de efectos que empiece
+              antes que el). Si se reordena este bloque de efectos, repetir
+              esa misma verificacion antes de asumir que sigue limpio. */}
           <EffectComposer
             key={`${dofEnabled}|${bloomEnabled}|${aoEnabled}|${grainEnabled}`}
             multisampling={dofEnabled ? 0 : 4}
@@ -1634,6 +1663,7 @@ export default function App() {
             {bloomEnabled ? (
               <Bloom luminanceThreshold={bloomThreshold} luminanceSmoothing={0.3} intensity={bloomIntensity} mipmapBlur />
             ) : null}
+            <ToneMapping mode={toneMappingEffectMode} />
             <BrightnessContrast brightness={colorBrightness} contrast={colorContrast} />
             <Vignette eskil={false} offset={vignetteOffset} darkness={vignetteDarkness} />
             {grainEnabled ? (
