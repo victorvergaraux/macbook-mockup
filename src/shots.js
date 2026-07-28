@@ -42,7 +42,7 @@ export const SHOTS = [];
 //     shotEase: easing del micro-movimiento a->b dentro de cada toma. Ambos
 //     referencian EASINGS en Cinematic.jsx.
 export const CINEMATIC_CONFIG = {
-  lidDuration: 4,
+  lidDuration: 7.5,
   shotDuration: 3,
   lidStart: 90,
   lidEnd: -10,

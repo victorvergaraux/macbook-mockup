@@ -124,13 +124,30 @@ html, body, #root {
   position: fixed;
   inset: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 12px;
   background: var(--bg);
   z-index: 100;
   font-size: 14px;
   color: #444;
   font-weight: 600;
+}
+
+.loading-screen-bar-track {
+  width: 220px;
+  height: 4px;
+  border-radius: 30rem;
+  background: rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.loading-screen-bar-fill {
+  height: 100%;
+  background: #1c1c1e;
+  border-radius: inherit;
+  transition: width 0.15s ease-out;
 }
 
 .leva-container {

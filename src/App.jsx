@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useThree, useFrame } from '@react-three/fiber';
 import {
   Color,
@@ -14,6 +14,8 @@ import {
   Center,
   Bounds,
   useBounds,
+  useProgress,
+  PerformanceMonitor,
 } from '@react-three/drei';
 import {
   EffectComposer,
@@ -36,6 +38,16 @@ import { CinematicRig } from './Cinematic.jsx';
 import { SHOTS, CINEMATIC_CONFIG } from './shots.js';
 
 const ENV_PRESETS = ['studio', 'city', 'sunset', 'dawn', 'warehouse', 'apartment', 'forest', 'lobby'];
+
+// drei's <Environment preset="..."> descarga el HDRI de un CDN externo
+// (polyhaven via pmndrs), bloqueante y fuera de nuestro control de cache. El
+// preset default ('studio') se sirve en cambio desde @pmndrs/assets, empacado
+// en el propio build (import dinamico -> chunk propio, se pide en paralelo al
+// resto de assets locales en vez de a un host externo). Los demas presets
+// siguen viniendo del CDN (carga bajo demanda solo si el usuario los elige,
+// no vale la pena empacarlos todos).
+const LOCAL_HDRI_PRESET = 'studio';
+const localHdriPromise = import('@pmndrs/assets/hdri/studio.exr.js').then((m) => m.default);
 
 // Leva registra `folderSettings.render` UNA SOLA VEZ (la primera llamada que
 // crea el path del folder) y nunca la vuelve a leer del closure de React.
@@ -170,6 +182,43 @@ function PostFXAutoClearGuard() {
   return null;
 }
 
+/** frameloop="demand" (ver <Canvas> mas abajo) solo re-renderiza cuando algo
+ * lo pide. Un THREE.VideoTexture necesita un frame nuevo por cada frame de
+ * video (el <video> sigue avanzando solo, pero sin un render no se ve en
+ * pantalla) -- este componente pide exactamente eso mientras `playing` este
+ * activo, y deja de pedirlo en pausa/sin video. */
+function VideoFrameInvalidator({ playing }) {
+  const { invalidate } = useThree();
+  useFrame(() => {
+    if (playing) invalidate();
+  });
+  return null;
+}
+
+/** Red de seguridad de frameloop="demand": R3F solo auto-invalida cuando
+ * cambia una prop JSX de un elemento host (`<mesh>`, `<N8AO>`, etc, via su
+ * `applyProps` interno) -- pero la MAYORIA de los controles de Leva de esta
+ * app (Metal, Screen/reflection, Design/brightness, tone mapping, shadow,
+ * wireframe...) los aplica Macbook.jsx/App.jsx de forma imperativa dentro de
+ * un useEffect (`ref.current.algo = valor`), no como prop JSX -- ese tipo de
+ * mutacion NO dispara el auto-invalidate de R3F. Sin componente aparte,
+ * mover cualquiera de esos sliders no se veria hasta que algo no
+ * relacionado (orbitar la camara) forzara un frame nuevo.
+ * Fix generico en vez de perseguir cada mutacion imperativa una por una:
+ * este componente no toma props, asi que React lo vuelve a renderizar en
+ * CADA commit del arbol que vive dentro del <Canvas> (cualquier cambio de
+ * estado en App, sin importar cual), y su useEffect sin deps (corre despues
+ * de CADA render) pide un frame nuevo en ese mismo commit -- restaura,
+ * commit a commit, el mismo comportamiento visible que "always" tenia,
+ * mientras la escena sigue sin gastar frames cuando NADA cambia. */
+function InvalidateOnCommit() {
+  const { invalidate } = useThree();
+  useEffect(() => {
+    invalidate();
+  });
+  return null;
+}
+
 /** Anima la camara a una posicion/target absolutos cuando `request` cambia
  * (usado por los presets de camara). Independiente del sistema `view` +
  * Bounds (ese sigue instantaneo a proposito, ver ViewController mas abajo):
@@ -178,8 +227,12 @@ function PostFXAutoClearGuard() {
  * estado esferico en cada `update()`, no respeta mutaciones externas de
  * camera.position mientras esta activo). */
 function CameraPresetRig({ request, orbitRef }) {
-  const { camera } = useThree();
+  const { camera, invalidate } = useThree();
   const animRef = useRef(null);
+  // Vector3 pre-alojado para el target interpolado -- mismo patron que
+  // Cinematic.jsx (posA/posB/targetA/targetB/posOut/targetOut), evita un
+  // `new Vector3()` por frame durante el tween.
+  const targetOut = useRef(new Vector3());
 
   useEffect(() => {
     if (!request) return;
@@ -194,7 +247,12 @@ function CameraPresetRig({ request, orbitRef }) {
       duration: Math.max(request.duration ?? 1, 0.001),
       elapsed: 0,
     };
-  }, [request, camera, orbitRef]);
+    // frameloop="demand": el tween dura mas de un frame, asi que necesita
+    // pedir el siguiente el mismo (ver invalidate() en el useFrame de abajo,
+    // mientras animRef.current siga activo) -- este primer invalidate arranca
+    // esa cadena apenas se solicita el preset.
+    invalidate();
+  }, [request, camera, orbitRef, invalidate]);
 
   useFrame((_, delta) => {
     const anim = animRef.current;
@@ -203,8 +261,9 @@ function CameraPresetRig({ request, orbitRef }) {
     const t = Math.min(anim.elapsed / anim.duration, 1);
     const eased = t * t * (3 - 2 * t);
     camera.position.lerpVectors(anim.startPos, anim.endPos, eased);
-    const target = new Vector3().lerpVectors(anim.startTarget, anim.endTarget, eased);
-    camera.lookAt(target);
+    targetOut.current.lerpVectors(anim.startTarget, anim.endTarget, eased);
+    camera.lookAt(targetOut.current);
+    if (t < 1) invalidate();
     if (t >= 1) {
       const controls = orbitRef.current;
       if (controls) {
@@ -398,7 +457,51 @@ function CompositionGrid() {
   );
 }
 
+/** Overlay DOM (fuera del <Canvas>) mientras cargan el GLB + texturas: sin
+ * esto la pantalla queda en blanco durante toda la descarga inicial (no habia
+ * Suspense con fallback, ver <Suspense> mas abajo en el JSX de App). useProgress
+ * lee de THREE.DefaultLoadingManager, compartido por todos los loaders de
+ * three.js (useGLTF, useLoader) sin importar si el componente que lo consulta
+ * vive dentro o fuera del Canvas. Se auto-oculta apenas `active` cae a false
+ * (loaders sin trabajo pendiente). */
+function LoadingOverlay() {
+  const { active, progress } = useProgress();
+  if (!active) return null;
+  return (
+    <div className="loading-screen">
+      <div>Loading model…</div>
+      <div className="loading-screen-bar-track">
+        <div className="loading-screen-bar-fill" style={{ width: `${Math.round(progress)}%` }} />
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  // HDRI local para el preset default (LOCAL_HDRI_PRESET): mientras resuelve
+  // el import dinamico queda null y <Environment> cae al `preset` normal (CDN)
+  // como antes -- una vez resuelto, pasa a servirse local para siempre (la
+  // promesa es un singleton de modulo, no se vuelve a pedir por instancia).
+  const [localHdriUrl, setLocalHdriUrl] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    localHdriPromise.then((url) => {
+      if (!cancelled) setLocalHdriUrl(url);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // DPR adaptativo: arranca en el maximo (2, igual que el `dpr={[1,2]}` fijo
+  // de antes) y PerformanceMonitor de drei lo baja a 1 si el frame rate real
+  // decae (tipicamente al orbitar/arrastrar con el composer completo
+  // -- AO+bloom -- encima) y lo restaura apenas vuelve a ir fino. Esto NO
+  // afecta la calidad del archivo exportado: CaptureRig (mas abajo) ya sube
+  // el pixel ratio de forma imperativa solo durante la captura y lo
+  // restaura despues, por fuera de este estado.
+  const [dpr, setDpr] = useState(2);
+
   const [screenFile, setScreenFile] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const captureApiRef = useRef(null);
@@ -460,7 +563,7 @@ export default function App() {
   const [{ reflectionIntensity, reflectionRoughness }, setScreenReflection] = useControls(
     'Screen',
     () => ({
-      reflectionIntensity: { value: 0.4, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      reflectionIntensity: { value: 0.56, min: 0, max: 1, step: 0.01, label: 'reflection' },
       reflectionRoughness: { value: 0.25, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
     { collapsed: true }
@@ -720,6 +823,12 @@ export default function App() {
     { collapsed: true }
   );
 
+  // "medium" en preview (uno de los pases mas caros del composer, corriendo
+  // cada frame): sube a "high" solo durante el export (ver handleExport),
+  // asi la calidad del archivo final no baja en absoluto -- mismo criterio
+  // que el pixel ratio boost de CaptureRig.
+  const [aoQuality, setAoQuality] = useState('medium');
+
   // Grado de color final: tone mapping del renderer + viñeta + toques de
   // grano/color que rompen la limpieza sintetica del CGI.
   const [
@@ -946,7 +1055,20 @@ export default function App() {
   // que el usuario lo abre, y hay que re-aplicar la visibilidad en ese
   // momento, no solo al cambiar `cinematicActive`.
   useEffect(() => {
+    // Sigue en document.body (no un contenedor propio de Leva): el prop
+    // `className="leva-container"` de <Leva> mas abajo NO llega a aplicarse
+    // al DOM real en esta version de la libreria (verificado en runtime --
+    // el arbol del panel solo trae las clases hasheadas internas de Leva,
+    // "leva-container" no aparece en ningun nodo), asi que acotar el
+    // MutationObserver a ese selector lo dejaba sin root donde observar y
+    // rompia el toggle Play/Stop por completo (los dos quedaban visibles a
+    // la vez). Lo que SI se optimiza aca: coalescer con requestAnimationFrame
+    // -- Leva muta su DOM en cada tick de CUALQUIER slider, y sin esto el
+    // callback (con su recorrido de document.querySelectorAll('button'))
+    // corria una vez por mutacion en vez de una vez por frame.
+    let rafId = null;
     const applyVisibility = () => {
+      rafId = null;
       document.querySelectorAll('button').forEach((btn) => {
         if (btn.textContent === '▶ Play') {
           btn.parentElement.style.display = cinematicActive ? 'none' : '';
@@ -955,10 +1077,18 @@ export default function App() {
         }
       });
     };
+    const scheduleApply = () => {
+      if (rafId != null) return;
+      rafId = requestAnimationFrame(applyVisibility);
+    };
+
     applyVisibility();
-    const observer = new MutationObserver(applyVisibility);
+    const observer = new MutationObserver(scheduleApply);
     observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (rafId != null) cancelAnimationFrame(rafId);
+    };
   }, [cinematicActive]);
 
   // Las tomas son poses absolutas de mundo (ver comentario en shots.js): si
@@ -1175,6 +1305,14 @@ export default function App() {
     try {
       const wantTransparent = exportTransparentBg && exportFormat === 'png';
       const preset = ASPECT_PRESETS.find((p) => p.id === exportAspect);
+      // Boost puntual de AO a "high" solo para el archivo exportado (ver
+      // useState de aoQuality, mas arriba): 3 frames de margen para que el
+      // cambio de prop llegue a commitear y el pase de N8AO ya este
+      // corriendo en high antes de que CaptureRig lea el canvas -- mismo
+      // patron que el propio waitFrames(3) que CaptureRig ya usa para el
+      // pixel ratio.
+      setAoQuality('high');
+      await waitFrames(3);
       // La captura transparente oculta fondo/postprocesado de forma
       // imperativa dentro de CaptureRig (ver App.jsx CaptureRig.capture),
       // asi que aqui no hace falta orquestar estado de React para eso.
@@ -1185,6 +1323,7 @@ export default function App() {
         aspect: preset?.ratio ?? null,
       });
     } finally {
+      setAoQuality('medium');
       setIsExporting(false);
     }
   }, [exportFormat, exportQuality, exportTransparentBg, exportAspect, isExporting]);
@@ -1231,6 +1370,8 @@ export default function App() {
         titleBar={{ title: 'Scene Controls' }}
         className="leva-container"
       />
+
+      <LoadingOverlay />
 
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
@@ -1288,11 +1429,27 @@ export default function App() {
       <div className="canvas-wrap">
         <Canvas
           camera={{ position: VIEW_PRESETS.iso, near: 0.1, far: 20, fov }}
-          gl={{ preserveDrawingBuffer: true, alpha: true, antialias: true }}
-          dpr={[1, 2]}
+          gl={{ preserveDrawingBuffer: true, alpha: true }}
+          dpr={dpr}
+          // demand: sin esto la escena renderiza a 60fps con AO+bloom+MSAA
+          // encima aunque nadie interactue ni haya nada animandose -- el
+          // mayor gasto de GPU/bateria de la app en reposo. Cualquier cambio
+          // de props de React (arrastrar un slider de Leva, cargar un
+          // archivo) ya dispara un render bajo demanda solo (R3F invalida en
+          // cada commit); lo unico que necesita seguir pidiendo frames de
+          // forma continua -- auto-rotacion, video reproduciendose, tween de
+          // preset de camara, cinematica -- llama `invalidate()` el mismo
+          // desde su propio useFrame mientras esta activo (ver
+          // CameraPresetRig, CinematicRig, y el useFrame de auto-rotacion en
+          // Macbook.jsx). OrbitControls de drei ya hace lo mismo solo al
+          // orbitar/hacer zoom, sin cambios de nuestra parte.
+          frameloop="demand"
         >
           <ambientLight intensity={0.6} />
-          <directionalLight position={[-5, 9, 2]} intensity={1.4} castShadow />
+          {/* Sin castShadow: el <Canvas> no trae la prop `shadows`, asi que
+              esta luz nunca proyecto sombras -- ver ContactShadows mas abajo,
+              que es el mecanismo real de sombra de contacto de la app. */}
+          <directionalLight position={[-5, 9, 2]} intensity={1.4} />
 
           {/* maxDuration=0: encuadre instantaneo, sin tween. Si el usuario
               hace click/orbita mientras la camara todavia esta en transito,
@@ -1301,37 +1458,45 @@ export default function App() {
               en la que eso pueda pasar. */}
           <Bounds fit observe margin={zoomMargin} maxDuration={0}>
             <ViewController view={view} zoomMargin={zoomMargin} fov={fov} refitToken={refitToken} />
-            <Center top>
-              <Macbook
-                onScreenAspect={setScreenAspect}
-                screenTexture={screenTexture}
-                imageTransform={imageTransform}
-                brightness={brightness}
-                modelRotationY={modelRotationY}
-                lidAngle={lidAngle}
-                lidAngleRef={cinematicActive ? lidAngleRef : undefined}
-                rotationResetKey={rotationResetKey}
-                reflectionIntensity={reflectionIntensity}
-                reflectionRoughness={reflectionRoughness}
-                metalTiling={metalTiling}
-                metalRoughnessAmount={metalRoughnessAmount}
-                metalMetalnessAmount={metalMetalnessAmount}
-                metalNormalIntensity={metalNormalIntensity}
-                fingerprintTiling={fingerprintTiling}
-                fingerprintOpacity={fingerprintOpacity}
-                fingerprintRoughnessAmount={fingerprintRoughnessAmount}
-                fingerprintNormalIntensity={fingerprintNormalIntensity}
-                fingerprintMetalnessAmount={fingerprintMetalnessAmount}
-                vignetteRadius={vignetteRadius}
-                vignetteIntensity={vignetteIntensity}
-                imperfectionEnabled={imperfectionEnabled}
-                autoRotate={autoRotate}
-                autoRotateSpeed={autoRotateSpeed}
-                rotateSway={rotateSway}
-                rotateRange={rotateRange}
-                wireframe={wireframe}
-              />
-            </Center>
+            {/* Suspense: sin esto el <Canvas> se queda vacio (sin siquiera
+                seguir montando hermanos) mientras useGLTF/useLoader resuelven
+                el GLB + texturas -- LoadingOverlay (DOM, fuera del Canvas)
+                cubre visualmente ese hueco mientras tanto. null de fallback:
+                no hace falta geometria de reemplazo, el overlay ya comunica
+                el estado de carga. */}
+            <Suspense fallback={null}>
+              <Center top>
+                <Macbook
+                  onScreenAspect={setScreenAspect}
+                  screenTexture={screenTexture}
+                  imageTransform={imageTransform}
+                  brightness={brightness}
+                  modelRotationY={modelRotationY}
+                  lidAngle={lidAngle}
+                  lidAngleRef={cinematicActive ? lidAngleRef : undefined}
+                  rotationResetKey={rotationResetKey}
+                  reflectionIntensity={reflectionIntensity}
+                  reflectionRoughness={reflectionRoughness}
+                  metalTiling={metalTiling}
+                  metalRoughnessAmount={metalRoughnessAmount}
+                  metalMetalnessAmount={metalMetalnessAmount}
+                  metalNormalIntensity={metalNormalIntensity}
+                  fingerprintTiling={fingerprintTiling}
+                  fingerprintOpacity={fingerprintOpacity}
+                  fingerprintRoughnessAmount={fingerprintRoughnessAmount}
+                  fingerprintNormalIntensity={fingerprintNormalIntensity}
+                  fingerprintMetalnessAmount={fingerprintMetalnessAmount}
+                  vignetteRadius={vignetteRadius}
+                  vignetteIntensity={vignetteIntensity}
+                  imperfectionEnabled={imperfectionEnabled}
+                  autoRotate={autoRotate}
+                  autoRotateSpeed={autoRotateSpeed}
+                  rotateSway={rotateSway}
+                  rotateRange={rotateRange}
+                  wireframe={wireframe}
+                />
+              </Center>
+            </Suspense>
           </Bounds>
 
           {shadowEnabled && (
@@ -1346,14 +1511,25 @@ export default function App() {
             />
           )}
 
-          <Environment
-            preset={envPreset}
-            background={envAsBackground}
-            backgroundBlurriness={blur}
-            environmentIntensity={envIntensity}
-            environmentRotation={envRotation}
-            backgroundRotation={envRotation}
-          />
+          {envPreset === LOCAL_HDRI_PRESET && localHdriUrl ? (
+            <Environment
+              files={localHdriUrl}
+              background={envAsBackground}
+              backgroundBlurriness={blur}
+              environmentIntensity={envIntensity}
+              environmentRotation={envRotation}
+              backgroundRotation={envRotation}
+            />
+          ) : (
+            <Environment
+              preset={envPreset}
+              background={envAsBackground}
+              backgroundBlurriness={blur}
+              environmentIntensity={envIntensity}
+              environmentRotation={envRotation}
+              backgroundRotation={envRotation}
+            />
+          )}
 
           <BackgroundController envAsBackground={envAsBackground} bgColor={bgColor} />
 
@@ -1384,7 +1560,13 @@ export default function App() {
             registerCinematicApi={registerCinematicApi}
           />
 
+          <PerformanceMonitor onDecline={() => setDpr(1)} onIncline={() => setDpr(2)} />
+
           <PostFXAutoClearGuard />
+
+          <InvalidateOnCommit />
+
+          <VideoFrameInvalidator playing={isVideo && playing} />
 
           {/* El composer queda SIEMPRE montado (antes solo existia con
               bloom/dof activos): con el viejo `(dofEnabled || bloomEnabled) &&`
@@ -1438,7 +1620,7 @@ export default function App() {
                 aoRadius={aoRadius}
                 distanceFalloff={aoDistanceFalloff}
                 intensity={aoIntensity}
-                quality="high"
+                quality={aoQuality}
               />
             ) : null}
             {dofEnabled ? (

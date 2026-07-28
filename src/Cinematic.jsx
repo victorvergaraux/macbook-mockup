@@ -51,7 +51,7 @@ export const EASINGS = {
  * (no por frame), para que App aplique fov/focus via los `set` de Leva.
  */
 export function CinematicRig({ active, shots, config, orbitRef, lidAngleRef, onShotChange, registerCinematicApi }) {
-  const { camera } = useThree();
+  const { camera, invalidate } = useThree();
   const clockRef = useRef({ elapsed: 0, cycle: 0, shotIndex: -1, shotElapsed: 0 });
   const posA = useRef(new Vector3());
   const posB = useRef(new Vector3());
@@ -97,6 +97,12 @@ export function CinematicRig({ active, shots, config, orbitRef, lidAngleRef, onS
 
   useFrame((_, rawDelta) => {
     if (!active || !camera) return;
+    // frameloop="demand" (App.jsx): la cinematica es una animacion continua
+    // de decenas de segundos, no un solo tween puntual -- sin este
+    // invalidate() por frame, el render se congelaria en el primer frame
+    // apenas dejara de haber otro motivo para re-renderizar (ej. Leva no se
+    // esta tocando).
+    invalidate();
     const clock = clockRef.current;
     // Clampeado: un delta enorme (pestana que perdio foco, jank de carga de
     // textura, primer frame tras activar) no debe poder saltar de un salto

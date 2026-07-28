@@ -3,3 +3,8 @@ dist
 .playwright-mcp
 *.log
 plans
+# Assets fuente sin usar en runtime (GLB alternativo, mapas 2k sin importar,
+# duplicados) -- ver plan de performance. No viven en src/ para que ninguna
+# herramienta los confunda con assets activos, pero se conservan localmente
+# por si hace falta regenerar algo a futuro.
+assets-source

@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
 import { useFrame, useLoader, useThree } from '@react-three/fiber';
-import modelUrl from '../src/macbook/source/mackbook.glb?url';
-import metalRoughnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Roughness.jpg?url';
-import metalMetalnessUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Metallic.jpg?url';
-import metalNormalUrl from '../src/macbook/PBR/Poliigon_MetalSteelBrushed_7174_Normal.png?url';
-import fingerprintRoughnessUrl from '../src/macbook/PBR/imperfection_0002_roughness_2k.jpg?url';
-import fingerprintNormalUrl from '../src/macbook/PBR/imperfection_0002_normal_opengl_2k.png?url';
-import fingerprintColorUrl from '../src/macbook/PBR/imperfection_0002_color_2k.jpg?url';
-import fingerprintOpacityMapUrl from '../src/macbook/PBR/imperfection_0002_opacity_2k.jpg?url';
+import modelUrl from '../src/macbook/source/mackbook-optimized.glb?url';
+// Texturas PBR servidas desde PBR/optimized/ (WebP, generadas por
+// `npm run assets:textures` desde scripts/optimize-textures.mjs) -- ver plan
+// de performance: los originales 2k (PBR/*.jpg,*.png) quedan versionados como
+// fuente, pero nunca se importan directo (el normal map original pesa 13MB).
+import metalRoughnessUrl from '../src/macbook/PBR/optimized/metal_roughness.webp?url';
+import metalMetalnessUrl from '../src/macbook/PBR/optimized/metal_metalness.webp?url';
+import metalNormalUrl from '../src/macbook/PBR/optimized/metal_normal.webp?url';
+import fingerprintRoughnessUrl from '../src/macbook/PBR/optimized/imperfection_roughness.webp?url';
+import fingerprintNormalUrl from '../src/macbook/PBR/optimized/imperfection_normal.webp?url';
+import fingerprintColorUrl from '../src/macbook/PBR/optimized/imperfection_color.webp?url';
+import fingerprintOpacityMapUrl from '../src/macbook/PBR/optimized/imperfection_opacity.webp?url';
 
 useGLTF.preload(modelUrl);
 
@@ -192,7 +196,15 @@ function getScreenAspect(mesh) {
   return width / height;
 }
 
-export default function Macbook({
+// memo: App.jsx es un unico componente con ~30 useControls de Leva -- CUALQUIER
+// control (incluidos los que solo alimentan el EffectComposer -- Focus/AO/
+// Grade, que Macbook ni recibe) re-renderiza todo App y reconciliaria este
+// subarbol (GLB + 28 materiales + varias texturas) si no fuera por este memo.
+// Todas las props de abajo ya son primitivas u objetos memoizados en el padre
+// (imageTransform: App.jsx useMemo; onScreenAspect: setState estable), asi
+// que la comparacion shallow default de memo es suficiente sin comparator
+// custom.
+function Macbook({
   onScreenAspect,
   screenTexture,
   imageTransform,
@@ -223,7 +235,7 @@ export default function Macbook({
   ...props
 }) {
   const { scene } = useGLTF(modelUrl);
-  const { scene: r3fScene, gl } = useThree();
+  const { scene: r3fScene, gl, invalidate } = useThree();
   const clonedScene = useMemo(() => scene.clone(true), [scene]);
   const groupRef = useRef(null);
   const autoAngleRef = useRef(0);
@@ -290,11 +302,17 @@ export default function Macbook({
   ]);
 
   // Repeticion (tiling) del set de metal, controlable desde Leva.
+  // needsUpdate NO hace falta aca: solo fuerza re-subir el bitmap entero a
+  // GPU (costoso, y el mayor cuello de botella al arrastrar este slider --
+  // ver plan de performance), pero repeat/offset/rotation se leen del
+  // texture.matrix, que three.js recalcula solo (Texture.updateMatrix(), via
+  // refreshTransformUniform en WebGLRenderer) en cada frame sin importar este
+  // flag. Mismo razonamiento en el efecto de imperfeccion de mas abajo y en
+  // el efecto que aplica screenTexture.repeat/offset/rotation.
   useEffect(() => {
     const t = metalTiling ?? 3;
     [metalRoughness, metalMetalness, metalNormal].forEach((tex) => {
       tex.repeat.set(t, t);
-      tex.needsUpdate = true;
     });
   }, [metalTiling, metalRoughness, metalMetalness, metalNormal]);
 
@@ -306,7 +324,6 @@ export default function Macbook({
     const t = fingerprintTiling ?? 1;
     [fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha].forEach((tex) => {
       tex.repeat.set(t, t);
-      tex.needsUpdate = true;
     });
   }, [fingerprintTiling, fingerprintRoughness, fingerprintNormal, fingerprintColor, fingerprintAlpha]);
 
@@ -488,8 +505,15 @@ export default function Macbook({
     glassMat.roughnessMap = fingerprintRoughness;
     glassMat.normalMap = fingerprintNormal;
     glassMat.metalnessMap = fingerprintColor;
+    glassMat.needsUpdate = true;
 
-    if (fingerprintAlpha.image) {
+    // Debounce SOLO el rehorneado del canvas de vinieta (rebuild costoso: un
+    // canvas 1024x1024 + una CanvasTexture nueva en cada corrida) -- este
+    // efecto entero corre en cada tick de los sliders "tiling"/"radius"/
+    // "amount" del folder Screen, y sin este debounce se rehornea a la
+    // misma frecuencia que el drag del mouse.
+    const timeoutId = setTimeout(() => {
+      if (!fingerprintAlpha.image) return;
       const canvas = buildVignetteAlphaCanvas(fingerprintAlpha.image, {
         tileCount: fingerprintTiling ?? 1,
         radius: vignetteRadius ?? 0.75,
@@ -502,10 +526,16 @@ export default function Macbook({
       texture.needsUpdate = true;
       vignetteAlphaTextureRef.current = texture;
       glassMat.alphaMap = texture;
+      glassMat.needsUpdate = true;
       prevTexture?.dispose();
-    }
+      // frameloop="demand" (App.jsx): esta mutacion corre en un setTimeout,
+      // fuera de un commit de React -- sin este invalidate() manual el
+      // cambio de vinieta no se veria hasta el proximo motivo cualquiera de
+      // re-render (mover la camara, tocar otro slider).
+      invalidate();
+    }, 80);
 
-    glassMat.needsUpdate = true;
+    return () => clearTimeout(timeoutId);
   }, [
     imperfectionEnabled,
     fingerprintRoughness,
@@ -545,15 +575,22 @@ export default function Macbook({
       mats.forEach((mat) => {
         if (!mat) return;
         if (!mat.__pbrApplied) {
+          // Unica rama que cambia la topologia del shader (agrega mapas que
+          // antes no existian, USE_ROUGHNESSMAP/USE_NORMALMAP/USE_METALNESSMAP
+          // se fijan en compile-time) -- needsUpdate va SOLO aca, no en cada
+          // ajuste de roughness/metalness/normal de abajo, que son uniformes
+          // escalares y no requieren recompilar. Sin esta restriccion, mover
+          // cualquier slider del folder "Metal" recompilaba los 28 materiales
+          // del GLB en cada tick.
           mat.roughnessMap = metalRoughness;
           mat.normalMap = metalNormal;
           mat.metalnessMap = metalMetalness;
           mat.__pbrApplied = true;
+          mat.needsUpdate = true;
         }
         mat.roughness = metalRoughnessAmount ?? 1;
         mat.metalness = metalMetalnessAmount ?? 1;
         mat.normalScale.set(metalNormalIntensity ?? 1, metalNormalIntensity ?? 1);
-        mat.needsUpdate = true;
       });
     });
   }, [
@@ -575,6 +612,9 @@ export default function Macbook({
   // encima y por si sola es casi imperceptible). fingerprintRoughnessAmount
   // suma rugosidad EXTRA encima de esa base solo cuando las huellas estan
   // activas (huellas = vidrio mas sucio = reflejo mas blureado todavia).
+  // Sin needsUpdate: los cuatro son uniformes escalares (opacity/roughness/
+  // metalness/normalScale), three.js los sube solos cada frame -- mismo
+  // razonamiento que el efecto de reflectionIntensity/Roughness mas abajo.
   useEffect(() => {
     const glassMat = glassMaterialRef.current;
     if (!glassMat) return;
@@ -583,7 +623,6 @@ export default function Macbook({
     glassMat.roughness = THREE.MathUtils.clamp((reflectionRoughness ?? 0.08) + fingerprintExtra, 0, 1);
     glassMat.normalScale.set(fingerprintNormalIntensity ?? 0.6, fingerprintNormalIntensity ?? 0.6);
     glassMat.metalness = fingerprintMetalnessAmount ?? 0.35;
-    glassMat.needsUpdate = true;
   }, [
     fingerprintOpacity,
     fingerprintRoughnessAmount,
@@ -598,6 +637,7 @@ export default function Macbook({
     const mat = screenMaterialRef.current;
     if (!mat) return;
 
+    let nextMap;
     if (screenTexture) {
       const scaleX = imageTransform?.scaleX ?? 1;
       const scaleY = imageTransform?.scaleY ?? 1;
@@ -630,10 +670,16 @@ export default function Macbook({
       // muestreo en angulo rasante, aunque no "inventa" resolucion que la
       // imagen fuente no tenga (ver upscaleIfNeeded en useScreenTexture.js
       // para eso). Costo: ninguno perceptible, es filtrado nativo del GPU.
+      // NO se marca needsUpdate aca: eso fuerza un re-upload completo del
+      // bitmap a GPU, y este efecto corre en cada tick de los sliders de
+      // "Design" (width/height/offset/rotation) via imageTransform --
+      // repeat/offset/rotation viven en texture.matrix, que three.js
+      // recalcula solo cada frame (Texture.updateMatrix(), sin importar este
+      // flag). El upload real ya lo dispara useScreenTexture.js /
+      // useScreenVideoTexture.js una sola vez, al crear la textura.
       screenTexture.anisotropy = gl.capabilities.getMaxAnisotropy();
-      screenTexture.needsUpdate = true;
 
-      mat.map = screenTexture;
+      nextMap = screenTexture;
       // Valores >1 sobreexponen (recortan a blanco) para un brillo "pantalla
       // encendida"; <1 atenua.
       mat.color = new THREE.Color().setScalar(brightness ?? 1);
@@ -649,26 +695,35 @@ export default function Macbook({
       placeholder.repeat.set(1, 1);
       placeholder.offset.set(0, 0);
       placeholder.rotation = 0;
-      mat.map = placeholder;
+      nextMap = placeholder;
       mat.color = new THREE.Color(0xffffff);
     }
-    mat.needsUpdate = true;
+    // El shader solo necesita recompilar cuando `map` pasa de ausente a
+    // presente (o cambia de instancia) -- USE_MAP se fija en compile-time.
+    // Reasignar la misma textura en cada ajuste de brightness/offset/etc no
+    // lo requiere; mat.color de arriba ya es un uniforme que se actualiza
+    // solo, sin necesidad de needsUpdate.
+    if (mat.map !== nextMap) {
+      mat.map = nextMap;
+      mat.needsUpdate = true;
+    }
   }, [screenTexture, imageTransform, brightness, gl]);
 
   // Intensidad del reflejo (reflectivity de MeshBasicMaterial, 0-1) +
   // nitidez del reflejo del vidrio (clearcoatRoughness: 0 = espejo nitido,
-  // 1 = reflejo bien difuso/borroso).
+  // 1 = reflejo bien difuso/borroso). Sin needsUpdate: son uniformes
+  // escalares que three.js sube solos en cada frame (refreshUniformsCommon /
+  // refreshUniformsPhysical) -- forzar needsUpdate aca recompilaria el
+  // shader en cada tick de estos sliders sin necesidad.
   useEffect(() => {
     const mat = screenMaterialRef.current;
     if (mat) {
       mat.reflectivity = reflectionIntensity ?? 0.35;
-      mat.needsUpdate = true;
     }
     const glassMat = glassMaterialRef.current;
     if (glassMat) {
       glassMat.clearcoat = reflectionIntensity ?? 0.35;
       glassMat.clearcoatRoughness = reflectionRoughness ?? 0.08;
-      glassMat.needsUpdate = true;
     }
   }, [reflectionIntensity, reflectionRoughness]);
 
@@ -736,6 +791,10 @@ export default function Macbook({
   useFrame((_, delta) => {
     if (autoRotate) {
       autoAngleRef.current += delta * (autoRotateSpeed ?? 0.1);
+      // frameloop="demand" (App.jsx): sin este invalidate() el giro se
+      // congelaria en el primer frame apenas dejara de haber otro motivo
+      // para re-renderizar (Leva quieto, camara quieta).
+      invalidate();
     }
     const swing = rotateSway
       ? THREE.MathUtils.degToRad(rotateRange ?? 45) * Math.sin(autoAngleRef.current)
@@ -757,3 +816,5 @@ export default function Macbook({
     </group>
   );
 }
+
+export default memo(Macbook);
