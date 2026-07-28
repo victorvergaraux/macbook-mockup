@@ -867,7 +867,7 @@ export default function App() {
       vignetteOffset: { value: 0.15, min: 0, max: 1, step: 0.01, label: 'vignette offset' },
       vignetteDarkness: { value: 0.5, min: 0, max: 1, step: 0.01, label: 'vignette darkness' },
       grainEnabled: { value: false, label: 'grain' },
-      grainOpacity: { value: 0.02, min: 0, max: 0.2, step: 0.005, label: 'grain amount' },
+      grainOpacity: { value: 0.02, min: 0, max: 2, step: 0.01, label: 'grain amount' },
       colorBrightness: { value: 0, min: -1, max: 1, step: 0.01, label: 'brightness' },
       colorContrast: { value: 0, min: -1, max: 1, step: 0.01, label: 'contrast' },
       // No hay control de "hue"/"saturation" (HueSaturation de postprocessing)
@@ -1667,7 +1667,7 @@ export default function App() {
             <BrightnessContrast brightness={colorBrightness} contrast={colorContrast} />
             <Vignette eskil={false} offset={vignetteOffset} darkness={vignetteDarkness} />
             {grainEnabled ? (
-              <Noise premultiply blendFunction={BlendFunction.OVERLAY} opacity={grainOpacity} />
+              <Noise blendFunction={BlendFunction.OVERLAY} opacity={grainOpacity} />
             ) : null}
           </EffectComposer>
 
