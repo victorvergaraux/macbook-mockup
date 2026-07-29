@@ -827,7 +827,7 @@ export default function App() {
   const [{ aoEnabled, aoIntensity, aoRadius, aoDistanceFalloff }, setAO] = useControls(
     'AO',
     () => ({
-      aoEnabled: { value: true, label: 'enabled' },
+      aoEnabled: { value: false, label: 'enabled' },
       aoIntensity: { value: 3, min: 0, max: 10, step: 0.1, label: 'intensity' },
       aoRadius: { value: 0.4, min: 0.01, max: 2, step: 0.01, label: 'radius' },
       aoDistanceFalloff: { value: 0.5, min: 0.01, max: 2, step: 0.01, label: 'falloff' },
@@ -859,7 +859,7 @@ export default function App() {
     'Grade',
     () => ({
       toneMappingMode: {
-        value: 'agx',
+        value: 'aces',
         options: { AgX: 'agx', 'ACES Filmic': 'aces', Neutral: 'neutral' },
         label: 'tone map',
       },
@@ -966,6 +966,22 @@ export default function App() {
   const [refitToken, setRefitToken] = useState(0);
   const preCinematicSnapshotRef = useRef(null);
   const prevCinematicActiveRef = useRef(false);
+
+  // Bounds usa `observe` (reacciona a resize del canvas, no a que el GLB
+  // termine de cargar) -- por eso en la carga inicial el encuadre queda mal
+  // (camara lejos) hasta que un resize dispara el refit de Bounds. Pedimos un
+  // refit propio (mismo mecanismo que usa la cinematica via refitToken) en el
+  // flanco de bajada de `active` de useProgress, cuando el GLB + texturas ya
+  // resolvieron y el modelo real (no el fallback vacio del Suspense) ya esta
+  // montado dentro de <Bounds>.
+  const { active: loadingActive } = useProgress();
+  const prevLoadingActiveRef = useRef(loadingActive);
+  useEffect(() => {
+    if (prevLoadingActiveRef.current && !loadingActive) {
+      setRefitToken((k) => k + 1);
+    }
+    prevLoadingActiveRef.current = loadingActive;
+  }, [loadingActive]);
   const cinematicActionsRef = useRef({});
   // Boton Play/Stop del panel Leva: mismo condicional `cinematicActive` de
   // siempre (efectos de Cinematic.jsx, snapshot/restore, grid, etc. no
