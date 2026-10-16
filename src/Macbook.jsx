@@ -111,7 +111,9 @@ function computeScreenUvTransform(imageTransform) {
 // (la saliente se corre a la izquierda y sale de cuadro mientras la entrante
 // empuja desde la derecha), 2 = parallax bottom-up (la entrante sube desde
 // abajo tapando a la saliente, que se oscurece y se corre un poco mas lento
-// -- la diferencia de velocidad es lo que da la sensacion de parallax).
+// -- la diferencia de velocidad es lo que da la sensacion de parallax),
+// 3 = parallax up-bottom (espejo vertical del 2: la entrante baja desde
+// arriba).
 const CAROUSEL_MAP_FRAGMENT_CHUNK = /* glsl */ `
 #ifdef USE_MAP
   vec2 cUvA = vMapUv;
@@ -123,6 +125,11 @@ const CAROUSEL_MAP_FRAGMENT_CHUNK = /* glsl */ `
   } else if ( uTransitionType == 2 ) {
     cUvA = vMapUv + vec2( 0.0, -uProgress * 0.25 );
     cUvB = vMapUv + vec2( 0.0, 1.0 - uProgress );
+    cDimA = mix( 1.0, 0.35, uProgress );
+  } else if ( uTransitionType == 3 ) {
+    // Espejo vertical del tipo 2: la entrante baja desde arriba.
+    cUvA = vMapUv + vec2( 0.0, uProgress * 0.25 );
+    cUvB = vMapUv - vec2( 0.0, 1.0 - uProgress );
     cDimA = mix( 1.0, 0.35, uProgress );
   }
   vec4 cColA = texture2D( map, cUvA );
@@ -361,6 +368,7 @@ function Macbook({
   carouselTextures,
   carouselDurationSec,
   carouselTransitionType,
+  carouselTransitionSec,
   ...props
 }) {
   const { scene } = useGLTF(modelUrl);
@@ -1029,7 +1037,9 @@ function Macbook({
     clock.elapsed += delta;
 
     const total = Math.max(carouselDurationSec ?? 4, 0.5);
-    const transitionDur = Math.min(0.7, total * 0.4);
+    // La transicion sale del mismo slot: tope 90% para que siempre quede algo
+    // de hold (duration min 1s vs transicion max 2s).
+    const transitionDur = Math.min(carouselTransitionSec ?? 0.7, total * 0.9);
     const holdDur = Math.max(total - transitionDur, 0.05);
 
     if (clock.elapsed >= total) {

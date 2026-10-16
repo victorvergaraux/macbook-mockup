@@ -711,16 +711,21 @@ export default function App() {
   // abajo y el efecto de Macbook.jsx que lo aplica a TODAS las texturas del
   // set. Oculto (ambos controles) cuando no hay carrusel activo -- mismo
   // patron que el folder 'Video', condicionado por isVideo.
-  const [{ carouselDurationSec, carouselTransitionType }, , carouselControlsRef] = useTweak(
+  const [
+    { carouselDurationSec, carouselTransitionType, carouselTransitionSec },
+    ,
+    carouselControlsRef,
+  ] = useTweak(
     'Design',
     () => ({
       _sepCarousel: separator('Carousel'),
       carouselDurationSec: { value: 4, min: 1, max: 10, step: 0.5, label: 'duration (s)' },
       carouselTransitionType: {
         value: 0,
-        options: { Opacity: 0, 'Swipe left': 1, 'Parallax (bottom-up)': 2 },
+        options: { Opacity: 0, 'Swipe left': 1, 'Parallax (bottom-up)': 2, 'Parallax (up-bottom)': 3 },
         label: 'transition',
       },
+      carouselTransitionSec: { value: 0.7, min: 0.3, max: 2, step: 0.1, label: 'transition duration (s)' },
     }),
     { collapsed: true }
   );
@@ -1807,6 +1812,7 @@ export default function App() {
                   carouselTextures={carouselTextures}
                   carouselDurationSec={carouselDurationSec}
                   carouselTransitionType={carouselTransitionType}
+                  carouselTransitionSec={carouselTransitionSec}
                   modelRotationY={modelRotationY}
                   lidAngle={lidAngle}
                   lidAngleRef={cinematicActive ? lidAngleRef : undefined}
