@@ -642,12 +642,18 @@ export default function App() {
     'Design',
     () => ({
       _sepScreen: separator('Screen'),
-      // Subido (0.56->0.9, 0.25->0.02) a pedido: reflejo del HDRI lo mas
-      // nitido posible -- clearcoat/clearcoatRoughness del vidrio se atan a
-      // estos dos valores (ver Macbook.jsx), 0 de roughness = espejo nitido.
-      // El otro factor que afecta nitidez es la resolucion del envMap (ver
-      // prop `resolution` de <Environment> en el JSX de mas abajo).
-      reflectionIntensity: { value: 0.9, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      // reflectionIntensity NO es solo la fuerza del clearcoat del vidrio --
+      // tambien es `reflectivity` del material BASE de la imagen
+      // (MeshBasicMaterial + combine:MixOperation, ver Macbook.jsx): a mas
+      // alto, mas se MEZCLA/REEMPLAZA el map cargado por el color del
+      // environment reflejado. Subirlo a 0.9 (pedido anterior de "reflejo
+      // nitido") dejaba la pantalla casi 90% environment y solo 10% imagen
+      // real -- con el HDRI/fondo oscuros actuales, se veia casi negra.
+      // Vuelve a 0.56 (default original, balance ya probado) -- la nitidez
+      // pedida sigue intacta via reflectionRoughness bajo (0.02) y la
+      // resolucion del envMap (`resolution` en <Environment>, mas abajo),
+      // ninguno de los dos tapa la imagen.
+      reflectionIntensity: { value: 0.56, min: 0, max: 1, step: 0.01, label: 'reflection' },
       reflectionRoughness: { value: 0.02, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
     { collapsed: true }
@@ -666,12 +672,18 @@ export default function App() {
   // siempre, para cualquier width/height -- ver comentario ahi junto al
   // calculo de anchorX/anchorY): en 0 la imagen queda pegada arriba-
   // izquierda sin importar cuanto se escale; +/- la corre desde ese punto.
-  const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useTweak(
+  const [{ imgScaleX, imgScaleY, imgScale, offsetX, offsetY, imgRotation, brightness }, setDesign] = useTweak(
     'Design',
     () => ({
       _sepDesign: separator('Design'),
       imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'width' },
       imgScaleY: { value: 1, min: 0.1, max: scaleYMax, step: 0.01, label: 'height' },
+      // Zoom uniforme, pivot en el top-center (a diferencia de width/height,
+      // que pivotan arriba-izquierda) -- pensado para agrandar/achicar un
+      // logo o diseno centrado sin que se corra de lugar. Ver el calculo de
+      // repeat/offset en Macbook.jsx (useEffect de aplicar textura) para el
+      // detalle de por que el pivot de X e Y usan formulas distintas.
+      imgScale: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'scale' },
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
       offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
@@ -727,6 +739,7 @@ export default function App() {
     setDesign({
       imgScaleX: 1,
       imgScaleY: Math.max(0.1, fitScaleY),
+      imgScale: 1,
       offsetX: 0,
       offsetY: 0,
       imgRotation: 0,
@@ -1008,12 +1021,21 @@ export default function App() {
   // de suelto en la raiz, como habia quedado en el paso anterior).
   const exportActionsRef = useRef({});
   const [
-    { exportAspect, exportFormat, exportQuality, exportTransparentBg, hideExportUI },
+    {
+      exportAspect,
+      exportFormat,
+      exportQuality,
+      exportTransparentBg,
+      videoQuality,
+      videoDurationSec,
+      hideExportUI,
+    },
     ,
     exportControlsRef,
   ] = useTweak(
     'Export',
     () => ({
+      _sepImage: separator('Image'),
       exportAspect: {
         value: 'real',
         options: { Real: 'real', '1:1': '1:1', '16:9': '16:9', '9:16': '9:16', '4:5': '4:5' },
@@ -1023,6 +1045,24 @@ export default function App() {
       exportQuality: { value: 1, min: 0.5, max: 1, step: 0.01, label: 'jpg quality' },
       exportTransparentBg: { value: false, label: 'transparent bg (png)' },
       'Download image': button(() => exportActionsRef.current.handleExportImage?.()),
+      // Antes vivian en el folder 'Cinematic (Advanced)' -- movidas aca a
+      // pedido: el boton lee el handler mas reciente via cinematicActionsRef
+      // (mismo ref que usaba desde Cinematic), asi que mover estos controles
+      // de folder no le afecta en nada a esa logica.
+      _sepVideo: separator('Video'),
+      videoQuality: {
+        value: 'medium',
+        options: { 'Max (60fps)': 'max', 'Medium (30fps)': 'medium', 'Low (30fps)': 'low' },
+        label: 'video quality',
+      },
+      videoDurationSec: {
+        value: 15,
+        options: { '15s': 15, '30s': 30, '60s': 60 },
+        label: 'video duration',
+      },
+      exportVideoButton: button(() => cinematicActionsRef.current.handleExportVideo?.(), {
+        label: 'Export video (15s)',
+      }),
       hideExportUI: { value: false, label: 'hide UI' },
     }),
     { collapsed: true }
@@ -1138,7 +1178,7 @@ export default function App() {
   // mas arriba) para ocultar el panel sin afectar en nada la reproduccion,
   // que siempre lee de `shots`.
   const [
-    { gridEnabled, lidDurationSec, shotDurationSec, startDelaySec, videoQuality, shotSelect },
+    { gridEnabled, lidDurationSec, shotDurationSec, startDelaySec, shotSelect },
     setCinematic,
     cinematicControlsRef,
   ] = useTweak(
@@ -1155,12 +1195,10 @@ export default function App() {
       cinematicPlayToggle: button(() => cinematicActionsRef.current.handlePlayToggle?.(), {
         label: '▶ Play',
       }),
-      videoQuality: {
-        value: 'medium',
-        options: { 'Max (60fps)': 'max', 'Medium (30fps)': 'medium', 'Low (30fps)': 'low' },
-        label: 'video quality',
-      },
-      'Export video (15s)': button(() => cinematicActionsRef.current.handleExportVideo?.()),
+      // videoQuality/videoDurationSec/el boton de export se movieron al
+      // folder 'Export' (separator('Video') ahi) -- quedan solo las
+      // variables `videoQuality`/`videoDurationSec` viniendo de ESE useTweak
+      // mas arriba, usadas en handleExportVideo mas abajo.
       // Guia de encuadre (grid de tercios + cruz central): se dibuja en DOM,
       // fuera del <Canvas> (ver CompositionGrid mas abajo), y se oculta sola
       // mientras cinematicActive este prendido -- no hace falta snapshot ni
@@ -1231,6 +1269,14 @@ export default function App() {
     const btn = cinematicControlsRef.current?.cinematicPlayToggle;
     if (btn) btn.title = cinematicActive || cinematicPending ? '■ Stop' : '▶ Play';
   }, [cinematicActive, cinematicPending, cinematicControlsRef]);
+
+  // Mismo relabel en caliente para el boton de export (ahora en el folder
+  // 'Export'), reflejando la duracion elegida en 'video duration' sin
+  // recrear el schema.
+  useEffect(() => {
+    const btn = exportControlsRef.current?.exportVideoButton;
+    if (btn) btn.title = `Export video (${videoDurationSec}s)`;
+  }, [videoDurationSec, exportControlsRef]);
 
   // Las tomas son poses absolutas de mundo (ver comentario en shots.js): si
   // se capturan con el modelo girado o autorrotando, la composicion no va a
@@ -1385,8 +1431,8 @@ export default function App() {
   }, [cinematicActive, cinematicPending, videoEl, startDelaySec]);
 
   // Arranca Play (mismo reset + delay) y, apenas la cinematica de verdad
-  // empieza, grava 15s del canvas con MediaRecorder (capturApiRef.exportVideo,
-  // ver CaptureRig) y descarga el .webm resultante.
+  // empieza, grava `videoDurationSec` del canvas con MediaRecorder
+  // (capturApiRef.exportVideo, ver CaptureRig) y descarga el .webm resultante.
   const handleExportVideo = useCallback(() => {
     if (isExportingVideo) return;
     setIsExportingVideo(true);
@@ -1405,7 +1451,7 @@ export default function App() {
       // Barra de progreso: rAF propio en vez de atarla al propio recorder
       // (MediaRecorder no expone progreso) -- simple regla de tres sobre
       // performance.now(), misma duracion exacta que se le pasa a exportVideo.
-      const durationMs = 15000;
+      const durationMs = (videoDurationSec ?? 15) * 1000;
       const startedAt = performance.now();
       let rafId = null;
       const tick = () => {
@@ -1424,7 +1470,7 @@ export default function App() {
         setIsExportingVideo(false);
       }
     }, startDelaySec * 1000);
-  }, [isExportingVideo, videoEl, startDelaySec, videoQuality]);
+  }, [isExportingVideo, videoEl, startDelaySec, videoQuality, videoDurationSec]);
 
   cinematicActionsRef.current = {
     captureA,
@@ -1548,8 +1594,8 @@ export default function App() {
   exportActionsRef.current = { handleExportImage: handleExport };
 
   const imageTransform = useMemo(
-    () => ({ scaleX: imgScaleX, scaleY: imgScaleY, offsetX, offsetY, rotation: imgRotation }),
-    [imgScaleX, imgScaleY, offsetX, offsetY, imgRotation]
+    () => ({ scaleX: imgScaleX, scaleY: imgScaleY, scale: imgScale, offsetX, offsetY, rotation: imgRotation }),
+    [imgScaleX, imgScaleY, imgScale, offsetX, offsetY, imgRotation]
   );
 
   const envRotation = useMemo(() => [0, (envRotationY * Math.PI) / 180, 0], [envRotationY]);

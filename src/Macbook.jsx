@@ -692,9 +692,8 @@ function Macbook({
     if (screenTexture) {
       const scaleX = imageTransform?.scaleX ?? 1;
       const scaleY = imageTransform?.scaleY ?? 1;
-      const repeatX = 1 / scaleX;
-      const repeatY = 1 / scaleY;
-      screenTexture.repeat.set(repeatX, repeatY);
+      const offsetX = imageTransform?.offsetX ?? 0;
+      const offsetY = imageTransform?.offsetY ?? 0;
       // La textura tiene `center=(0.5,0.5)` fijo (useScreenTexture.js /
       // useScreenVideoTexture.js): three.js escala `repeat` alrededor de
       // ese centro, no de la esquina -- sampledUV = repeat*(meshUV-0.5)
@@ -703,16 +702,40 @@ function Macbook({
       // "recentra" en vez de encogerse desde arriba-izquierda). Sumando
       // 0.5*(repeat-1) al offset se cancela ese pivote central y el punto
       // sampledUV(meshUV=0)=offset (arriba-izquierda de la pantalla) queda
-      // fijo en 0 sin importar cuanto cambien width/height -- asi la
-      // imagen siempre se encoge/agranda desde la esquina, nunca desde el
-      // centro. offsetX/offsetY (los sliders "offset x/y") pasan a ser un
-      // PANEO relativo a ese anclaje: en 0 la imagen queda pegada
-      // arriba-izquierda; +/- la corre desde ahi, no desde el centro.
-      const anchorX = 0.5 * (repeatX - 1);
-      const anchorY = 0.5 * (repeatY - 1);
+      // fijo en 0 sin importar cuanto cambien width/height -- asi width/
+      // height siempre encogen/agrandan desde la esquina superior
+      // izquierda, nunca desde el centro. Esto colapsa a la formula lineal
+      // sampledU = repeatX*meshU + offsetX (idem para Y), que es la base
+      // sobre la que se compone el zoom uniforme de abajo.
+      const repeatX0 = 1 / scaleX;
+      const repeatY0 = 1 / scaleY;
+
+      // "scale" (zoom uniforme, control nuevo): a diferencia de width/
+      // height, pivotea en el TOP-CENTER de la pantalla, no en la esquina.
+      // En X eso es el centro horizontal (sampledU=0.5), que coincide con
+      // el pivote NATURAL de three.js (texture.center=(0.5,0.5)) -- por
+      // eso alcanza con dividir el repeat/offset ya calculados por `scale`
+      // sin ningun termino de compensacion extra en X (ver derivacion: con
+      // sampledU_final = (sampledU_original-0.5)/scale + 0.5, el algebra se
+      // simplifica a repeatX = repeatX0/scale, offsetX = (offsetX-0.5)/
+      // scale + 0.5, antes de la conversion repeat/offset de mas abajo).
+      // En Y el pivote pedido sigue siendo arriba (igual que width/height),
+      // asi que ahi "scale" se compone igual que width/height: mismo
+      // offsetY sin cambios, solo repeatY0/scale.
+      const scale = imageTransform?.scale ?? 1;
+      const repeatX = repeatX0 / scale;
+      const repeatY = repeatY0 / scale;
+      const sampledConstX = (offsetX - 0.5) / scale + 0.5;
+      const sampledConstY = offsetY;
+
+      screenTexture.repeat.set(repeatX, repeatY);
+      // offset real a setear = constante deseada (sampledUV en meshUV=0) +
+      // 0.5*(repeat-1), que es la conversion inversa de la formula de
+      // three.js descrita arriba (sampledUV = repeat*meshUV + offset_real
+      // - 0.5*(repeat-1), despejando offset_real).
       screenTexture.offset.set(
-        anchorX + (imageTransform?.offsetX ?? 0),
-        anchorY + (imageTransform?.offsetY ?? 0)
+        sampledConstX + 0.5 * (repeatX - 1),
+        sampledConstY + 0.5 * (repeatY - 1)
       );
       screenTexture.rotation = THREE.MathUtils.degToRad(imageTransform?.rotation ?? 0);
       // Anisotropy al maximo del GPU (no un valor fijo bajo): la pantalla se
