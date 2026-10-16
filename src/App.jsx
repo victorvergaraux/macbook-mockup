@@ -26,6 +26,7 @@ import { useTweak, button, buttonGroup, folder, separator, collapseAllFolders } 
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { useScreenVideoTexture } from './useScreenVideoTexture.js';
+import { useCarouselTextures } from './useCarouselTextures.js';
 import { UploadCloud } from 'lucide-react';
 import { exportCanvas } from './exporter.js';
 import { CinematicRig } from './Cinematic.jsx';
@@ -46,6 +47,8 @@ const VIDEO_QUALITY_PRESETS = {
 // resto son [ancho, alto] para cropToAspect (recorte al centro, sin upscale).
 // Antes vivia en ExportPanel.jsx (panel DOM aparte, ver folder 'Export' de
 // abajo que lo reemplaza entero).
+const MAX_CAROUSEL_IMAGES = 10;
+
 const ASPECT_PRESETS = [
   { id: 'real', label: 'Real', ratio: null },
   { id: '1:1', label: '1:1', ratio: [1, 1] },
@@ -577,6 +580,10 @@ export default function App() {
   const [dpr, setDpr] = useState(2);
 
   const [screenFile, setScreenFile] = useState(null);
+  // Carrusel: 2 a 10 imagenes a la vez (ver MAX_CAROUSEL_IMAGES), excluyente
+  // con screenFile -- soltar un archivo nuevo (imagen/video sueltos) limpia
+  // este array, y soltar 2+ imagenes a la vez limpia screenFile.
+  const [screenFiles, setScreenFiles] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const captureApiRef = useRef(null);
   const orbitRef = useRef(null);
@@ -589,6 +596,7 @@ export default function App() {
   const imageTexture = useScreenTexture(isVideo ? null : screenFile);
   const { texture: videoTexture, video: videoEl, error: videoError } =
     useScreenVideoTexture(isVideo ? screenFile : null);
+  const carouselTextures = useCarouselTextures(screenFiles);
 
   const screenTexture = isVideo ? videoTexture : imageTexture;
 
@@ -695,6 +703,35 @@ export default function App() {
     { collapsed: true },
     [scaleYMax]
   );
+
+  // Carrusel (2-10 imagenes arrastradas a la vez, ver handleIncomingFiles):
+  // solo dos ajustes, duracion por imagen y estilo de transicion -- el
+  // transform (width/height/scale/offset/rotation/brightness) de arriba se
+  // comparte con el carrusel sin controles aparte, ver imageTransform mas
+  // abajo y el efecto de Macbook.jsx que lo aplica a TODAS las texturas del
+  // set. Oculto (ambos controles) cuando no hay carrusel activo -- mismo
+  // patron que el folder 'Video', condicionado por isVideo.
+  const [{ carouselDurationSec, carouselTransitionType }, , carouselControlsRef] = useTweak(
+    'Design',
+    () => ({
+      _sepCarousel: separator('Carousel'),
+      carouselDurationSec: { value: 4, min: 1, max: 10, step: 0.5, label: 'duration (s)' },
+      carouselTransitionType: {
+        value: 0,
+        options: { Opacity: 0, 'Swipe left': 1, 'Parallax (bottom-up)': 2 },
+        label: 'transition',
+      },
+    }),
+    { collapsed: true }
+  );
+
+  const carouselActive = (carouselTextures?.length ?? 0) >= 2;
+  useEffect(() => {
+    Object.entries(carouselControlsRef.current ?? {}).forEach(([key, ctrl]) => {
+      if (key === '__folder') return;
+      ctrl.hidden = !carouselActive;
+    });
+  }, [carouselActive, carouselControlsRef]);
 
   // Auto-ajuste al cargar imagen/video (o al cambiar de mesh de pantalla):
   // "ajustar a lo ancho, escalar proporcionalmente en alto, top-left".
@@ -1600,12 +1637,38 @@ export default function App() {
 
   const envRotation = useMemo(() => [0, (envRotationY * Math.PI) / 180, 0], [envRotationY]);
 
-  const onDrop = useCallback((e) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file && (file.type.startsWith('image/') || file.type.startsWith('video/'))) setScreenFile(file);
+  // Un solo punto de entrada para drop y <input multiple>: 2+ imagenes a la
+  // vez arman un carrusel (tope MAX_CAROUSEL_IMAGES, el resto se ignora con
+  // aviso); 1 archivo solo (imagen o video) sigue el camino de siempre.
+  const handleIncomingFiles = useCallback((fileList) => {
+    const files = Array.from(fileList ?? []);
+    if (!files.length) return;
+
+    const images = files.filter((f) => f.type.startsWith('image/'));
+    if (images.length >= 2) {
+      if (images.length > MAX_CAROUSEL_IMAGES) {
+        window.alert(`Maximo ${MAX_CAROUSEL_IMAGES} imagenes para el carrusel -- se usan las primeras ${MAX_CAROUSEL_IMAGES}.`);
+      }
+      setScreenFile(null);
+      setScreenFiles(images.slice(0, MAX_CAROUSEL_IMAGES));
+      return;
+    }
+
+    const file = files[0];
+    if (file && (file.type.startsWith('image/') || file.type.startsWith('video/'))) {
+      setScreenFiles(null);
+      setScreenFile(file);
+    }
   }, []);
+
+  const onDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      setIsDragging(false);
+      handleIncomingFiles(e.dataTransfer.files);
+    },
+    [handleIncomingFiles]
+  );
 
   const onDragOver = useCallback((e) => {
     e.preventDefault();
@@ -1617,10 +1680,12 @@ export default function App() {
     setIsDragging(false);
   }, []);
 
-  const onFileInputChange = useCallback((e) => {
-    const file = e.target.files?.[0];
-    if (file) setScreenFile(file);
-  }, []);
+  const onFileInputChange = useCallback(
+    (e) => {
+      handleIncomingFiles(e.target.files);
+    },
+    [handleIncomingFiles]
+  );
 
 
   return (
@@ -1666,6 +1731,7 @@ export default function App() {
             ref={fileInputRef}
             type="file"
             accept="image/*,video/mp4,video/webm"
+            multiple
             onChange={onFileInputChange}
             style={{ display: 'none' }}
           />
@@ -1738,6 +1804,9 @@ export default function App() {
                   screenTexture={screenTexture}
                   imageTransform={imageTransform}
                   brightness={brightness}
+                  carouselTextures={carouselTextures}
+                  carouselDurationSec={carouselDurationSec}
+                  carouselTransitionType={carouselTransitionType}
                   modelRotationY={modelRotationY}
                   lidAngle={lidAngle}
                   lidAngleRef={cinematicActive ? lidAngleRef : undefined}

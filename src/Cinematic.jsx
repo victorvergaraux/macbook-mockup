@@ -32,6 +32,14 @@ export const EASINGS = {
     const x = (t - split) / (1 - split);
     return split + (1 - split) * (1 - (1 - x) ** 3);
   },
+  // Arranca y termina casi en seco (curva exponencial, potencia 2^(20t-10))
+  // y acelera MUY fuerte en el tramo medio -- mucho mas marcado que
+  // inOutCubic/easeInOut. Default del carrusel de imagenes (Macbook.jsx).
+  inOutExpo: (t) => {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return t < 0.5 ? 2 ** (20 * t - 10) / 2 : (2 - 2 ** (-20 * t + 10)) / 2;
+  },
 };
 
 /**

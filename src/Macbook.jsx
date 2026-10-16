@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import { useGLTF } from '@react-three/drei';
 import { useFrame, useLoader, useThree } from '@react-three/fiber';
+import { EASINGS } from './Cinematic.jsx';
 import modelUrl from '../src/macbook/source/mackbook-optimized.glb?url';
 // Texturas PBR servidas desde PBR/optimized/ (WebP, generadas por
 // `npm run assets:textures` desde scripts/optimize-textures.mjs) -- ver plan
@@ -64,6 +65,80 @@ function hasColorMap(material) {
   const mats = Array.isArray(material) ? material : [material];
   return mats.some((m) => m?.map);
 }
+
+// Repeat/offset de UV para encoger/agrandar la imagen desde la esquina
+// arriba-izquierda (width/height) con un zoom extra pivoteado en el
+// top-center (scale) -- extraido del efecto de aplicar textura (mas abajo)
+// para poder reusarlo tal cual en el carrusel, que necesita aplicar el MISMO
+// transform a varias texturas a la vez (ver comentario de
+// CAROUSEL_MAP_FRAGMENT_CHUNK: todas comparten vMapUv, por eso tienen que
+// compartir tambien el mismo repeat/offset/rotation).
+function computeScreenUvTransform(imageTransform) {
+  const scaleX = imageTransform?.scaleX ?? 1;
+  const scaleY = imageTransform?.scaleY ?? 1;
+  const offsetX = imageTransform?.offsetX ?? 0;
+  const offsetY = imageTransform?.offsetY ?? 0;
+  const scale = imageTransform?.scale ?? 1;
+
+  const repeatX0 = 1 / scaleX;
+  const repeatY0 = 1 / scaleY;
+  const repeatX = repeatX0 / scale;
+  const repeatY = repeatY0 / scale;
+  const sampledConstX = (offsetX - 0.5) / scale + 0.5;
+  const sampledConstY = offsetY;
+
+  return {
+    repeatX,
+    repeatY,
+    offsetX: sampledConstX + 0.5 * (repeatX - 1),
+    offsetY: sampledConstY + 0.5 * (repeatY - 1),
+    rotation: THREE.MathUtils.degToRad(imageTransform?.rotation ?? 0),
+  };
+}
+
+// Patch GLSL inyectado en el MeshBasicMaterial del carrusel (ver
+// ensureCarouselMaterial mas abajo): reemplaza el chunk estandar
+// <map_fragment> (un solo sampler `map`) por una version con DOS samplers
+// (`map`/`mapB`, la imagen actual y la siguiente) que mezclan segun
+// `uProgress` y `uTransitionType`. `vMapUv` es la UV ya transformada por
+// `map.matrix` (repeat/offset/rotation/center, ver three.js uv_vertex.glsl)
+// -- se reusa para ambos samplers a proposito: todas las texturas del
+// carrusel reciben el MISMO repeat/offset/rotation (ver efecto de transform
+// en Macbook.jsx), asi que da lo mismo cual este asignada a `map` en un
+// momento dado, vMapUv queda correcto para las dos.
+//
+// Tipos (uTransitionType): 0 = opacity (crossfade liso), 1 = swipe left
+// (la saliente se corre a la izquierda y sale de cuadro mientras la entrante
+// empuja desde la derecha), 2 = parallax bottom-up (la entrante sube desde
+// abajo tapando a la saliente, que se oscurece y se corre un poco mas lento
+// -- la diferencia de velocidad es lo que da la sensacion de parallax).
+const CAROUSEL_MAP_FRAGMENT_CHUNK = /* glsl */ `
+#ifdef USE_MAP
+  vec2 cUvA = vMapUv;
+  vec2 cUvB = vMapUv;
+  float cDimA = 1.0;
+  if ( uTransitionType == 1 ) {
+    cUvA = vMapUv + vec2( uProgress, 0.0 );
+    cUvB = vMapUv - vec2( 1.0 - uProgress, 0.0 );
+  } else if ( uTransitionType == 2 ) {
+    cUvA = vMapUv + vec2( 0.0, -uProgress * 0.25 );
+    cUvB = vMapUv + vec2( 0.0, 1.0 - uProgress );
+    cDimA = mix( 1.0, 0.35, uProgress );
+  }
+  vec4 cColA = texture2D( map, cUvA );
+  cColA.rgb *= cDimA;
+  vec4 cColB = texture2D( mapB, cUvB );
+  float cInBoundsB = ( cUvB.x >= 0.0 && cUvB.x <= 1.0 && cUvB.y >= 0.0 && cUvB.y <= 1.0 ) ? 1.0 : 0.0;
+  float cInBoundsA = ( cUvA.x >= 0.0 && cUvA.x <= 1.0 && cUvA.y >= 0.0 && cUvA.y <= 1.0 ) ? 1.0 : 0.0;
+  vec4 sampledDiffuseColor;
+  if ( uTransitionType == 0 ) {
+    sampledDiffuseColor = mix( cColA, cColB, uProgress );
+  } else {
+    sampledDiffuseColor = mix( cColA * cInBoundsA, cColB, cInBoundsB );
+  }
+  diffuseColor *= sampledDiffuseColor;
+#endif
+`;
 
 function hasEmissiveMap(material) {
   const mats = Array.isArray(material) ? material : [material];
@@ -283,6 +358,9 @@ function Macbook({
   rotateSway,
   rotateRange,
   wireframe,
+  carouselTextures,
+  carouselDurationSec,
+  carouselTransitionType,
   ...props
 }) {
   const { scene } = useGLTF(modelUrl);
@@ -299,6 +377,43 @@ function Macbook({
   const bakedGlassMeshRef = useRef(null);
   const vignetteAlphaTextureRef = useRef(null);
   const placeholderTextureRef = useRef(null);
+  const carouselMaterialRef = useRef(null);
+  const carouselClockRef = useRef({ elapsed: 0, index: 0 });
+  const carouselActive = (carouselTextures?.length ?? 0) >= 2;
+
+  // Construccion perezosa (una sola vez) del material del carrusel: mismo
+  // MeshBasicMaterial + combine/envMap que screenMaterialRef (ver mas abajo),
+  // con un patch de shader (onBeforeCompile) que agrega un segundo sampler
+  // para crossfade/swipe/parallax entre dos imagenes -- ver
+  // CAROUSEL_MAP_FRAGMENT_CHUNK arriba. Se llama tanto desde el efecto que
+  // resuelve el mesh de pantalla como del que togglea carouselActive en
+  // caliente, asi que vive en una funcion para no duplicar el constructor.
+  const ensureCarouselMaterial = () => {
+    if (carouselMaterialRef.current) return carouselMaterialRef.current;
+    const mat = new THREE.MeshBasicMaterial({
+      map: null,
+      color: new THREE.Color(0x111214),
+      toneMapped: false,
+      combine: THREE.MixOperation,
+      reflectivity: 0,
+    });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.mapB = { value: null };
+      shader.uniforms.uProgress = { value: 0 };
+      shader.uniforms.uTransitionType = { value: 0 };
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'void main() {',
+        'uniform sampler2D mapB;\nuniform float uProgress;\nuniform int uTransitionType;\nvoid main() {'
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <map_fragment>',
+        CAROUSEL_MAP_FRAGMENT_CHUNK
+      );
+      mat.userData.shader = shader;
+    };
+    carouselMaterialRef.current = mat;
+    return mat;
+  };
   // Todo mesh que alguna vez fue "la pantalla" (seleccion manual via el
   // dropdown puede cambiarla mas de una vez): se excluyen para siempre del
   // efecto de metal, no solo el actual. Sin esto, al reasignar el selector
@@ -460,7 +575,7 @@ function Macbook({
           reflectivity: 0,
         });
       }
-      target.material = screenMaterialRef.current;
+      target.material = carouselActive ? ensureCarouselMaterial() : screenMaterialRef.current;
 
       if (!glassMaterialRef.current) {
         // Capa de "vidrio" independiente sobre la pantalla: separada del
@@ -531,6 +646,18 @@ function Macbook({
       });
     }
   }, [clonedScene, onScreenAspect]);
+
+  // Prender/apagar el carrusel en caliente (sin que el mesh de pantalla se
+  // re-resuelva, que es lo que gatilla el efecto de arriba) -- swap directo
+  // de material sobre el mismo mesh ya resuelto.
+  useEffect(() => {
+    const target = screenMeshRef.current;
+    if (!target) return;
+    target.material = carouselActive ? ensureCarouselMaterial() : screenMaterialRef.current;
+    if (!carouselActive) carouselClockRef.current = { elapsed: 0, index: 0 };
+    invalidate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [carouselActive]);
 
   // Toggle "Fingerprint > enabled": con las huellas apagadas, el vidrio
   // queda uniforme (sin roughnessMap/normalMap/metalnessMap/alphaMap),
@@ -684,60 +811,27 @@ function Macbook({
   ]);
 
   // Aplica la textura subida + transform (scale/offset/rotation) + brillo.
+  // Se salta entero en modo carrusel (otro efecto mas abajo se encarga, con
+  // VARIAS texturas a la vez) -- igual necesita `carouselActive` en las deps
+  // para volver a correr y restaurar el placeholder/imagen al salir de ese
+  // modo (la unica forma real de "salir" es soltando un archivo nuevo, que
+  // ya cambia `screenTexture` solo, pero no cuesta nada ser explicito).
   useEffect(() => {
+    if (carouselActive) return;
     const mat = screenMaterialRef.current;
     if (!mat) return;
 
     let nextMap;
     if (screenTexture) {
-      const scaleX = imageTransform?.scaleX ?? 1;
-      const scaleY = imageTransform?.scaleY ?? 1;
-      const offsetX = imageTransform?.offsetX ?? 0;
-      const offsetY = imageTransform?.offsetY ?? 0;
+      const { repeatX, repeatY, offsetX, offsetY, rotation } = computeScreenUvTransform(imageTransform);
       // La textura tiene `center=(0.5,0.5)` fijo (useScreenTexture.js /
       // useScreenVideoTexture.js): three.js escala `repeat` alrededor de
-      // ese centro, no de la esquina -- sampledUV = repeat*(meshUV-0.5)
-      // + 0.5 + offset. Sin compensar, mover el slider width/height
-      // encogeria la imagen desde el centro (el usuario veria que se
-      // "recentra" en vez de encogerse desde arriba-izquierda). Sumando
-      // 0.5*(repeat-1) al offset se cancela ese pivote central y el punto
-      // sampledUV(meshUV=0)=offset (arriba-izquierda de la pantalla) queda
-      // fijo en 0 sin importar cuanto cambien width/height -- asi width/
-      // height siempre encogen/agrandan desde la esquina superior
-      // izquierda, nunca desde el centro. Esto colapsa a la formula lineal
-      // sampledU = repeatX*meshU + offsetX (idem para Y), que es la base
-      // sobre la que se compone el zoom uniforme de abajo.
-      const repeatX0 = 1 / scaleX;
-      const repeatY0 = 1 / scaleY;
-
-      // "scale" (zoom uniforme, control nuevo): a diferencia de width/
-      // height, pivotea en el TOP-CENTER de la pantalla, no en la esquina.
-      // En X eso es el centro horizontal (sampledU=0.5), que coincide con
-      // el pivote NATURAL de three.js (texture.center=(0.5,0.5)) -- por
-      // eso alcanza con dividir el repeat/offset ya calculados por `scale`
-      // sin ningun termino de compensacion extra en X (ver derivacion: con
-      // sampledU_final = (sampledU_original-0.5)/scale + 0.5, el algebra se
-      // simplifica a repeatX = repeatX0/scale, offsetX = (offsetX-0.5)/
-      // scale + 0.5, antes de la conversion repeat/offset de mas abajo).
-      // En Y el pivote pedido sigue siendo arriba (igual que width/height),
-      // asi que ahi "scale" se compone igual que width/height: mismo
-      // offsetY sin cambios, solo repeatY0/scale.
-      const scale = imageTransform?.scale ?? 1;
-      const repeatX = repeatX0 / scale;
-      const repeatY = repeatY0 / scale;
-      const sampledConstX = (offsetX - 0.5) / scale + 0.5;
-      const sampledConstY = offsetY;
-
+      // ese centro, no de la esquina -- ver computeScreenUvTransform arriba
+      // para la derivacion completa del anclaje arriba-izquierda (width/
+      // height) + el zoom top-center (scale).
       screenTexture.repeat.set(repeatX, repeatY);
-      // offset real a setear = constante deseada (sampledUV en meshUV=0) +
-      // 0.5*(repeat-1), que es la conversion inversa de la formula de
-      // three.js descrita arriba (sampledUV = repeat*meshUV + offset_real
-      // - 0.5*(repeat-1), despejando offset_real).
-      screenTexture.offset.set(
-        sampledConstX + 0.5 * (repeatX - 1),
-        sampledConstY + 0.5 * (repeatY - 1)
-      );
-      screenTexture.rotation = THREE.MathUtils.degToRad(imageTransform?.rotation ?? 0);
+      screenTexture.offset.set(offsetX, offsetY);
+      screenTexture.rotation = rotation;
       // Anisotropy al maximo del GPU (no un valor fijo bajo): la pantalla se
       // ve casi siempre en angulo (vistas iso), y ahi es donde el filtrado
       // anisotropico marca la diferencia real -- ayuda a la nitidez del
@@ -781,7 +875,37 @@ function Macbook({
       mat.map = nextMap;
       mat.needsUpdate = true;
     }
-  }, [screenTexture, imageTransform, brightness, gl]);
+  }, [screenTexture, imageTransform, brightness, gl, carouselActive]);
+
+  // Mismo transform (repeat/offset/rotation) + brillo que el efecto de
+  // arriba, pero aplicado a TODAS las texturas del carrusel a la vez -- ver
+  // comentario de CAROUSEL_MAP_FRAGMENT_CHUNK: el shader reusa vMapUv (la UV
+  // ya transformada por `map.matrix`) para los dos samplers, asi que las dos
+  // texturas en juego en cualquier momento dado necesitan compartir
+  // exactamente el mismo repeat/offset/rotation o quedarian desalineadas
+  // entre si durante la transicion.
+  useEffect(() => {
+    if (!carouselActive || !carouselTextures) return;
+    const { repeatX, repeatY, offsetX, offsetY, rotation } = computeScreenUvTransform(imageTransform);
+    carouselTextures.forEach((tex) => {
+      tex.repeat.set(repeatX, repeatY);
+      tex.offset.set(offsetX, offsetY);
+      tex.rotation = rotation;
+      tex.anisotropy = gl.capabilities.getMaxAnisotropy();
+    });
+    const mat = carouselMaterialRef.current;
+    if (mat) mat.color = new THREE.Color().setScalar(brightness ?? 1);
+  }, [carouselActive, carouselTextures, imageTransform, brightness, gl]);
+
+  // Nuevo set de imagenes (otro drop): arranca siempre desde la primera, no
+  // desde donde haya quedado el set anterior. Deps acotadas a `carouselTextures`
+  // nada mas -- a diferencia del efecto de arriba, este NO debe correr de
+  // nuevo solo porque cambio brightness/imageTransform (reiniciaria el
+  // carrusel cada vez que se toca un slider de Design).
+  useEffect(() => {
+    if (!carouselActive || !carouselTextures) return;
+    carouselClockRef.current = { elapsed: 0, index: 0 };
+  }, [carouselActive, carouselTextures]);
 
   // Intensidad del reflejo (reflectivity de MeshBasicMaterial, 0-1) +
   // nitidez del reflejo del vidrio (clearcoatRoughness: 0 = espejo nitido,
@@ -793,6 +917,10 @@ function Macbook({
     const mat = screenMaterialRef.current;
     if (mat) {
       mat.reflectivity = reflectionIntensity ?? 0.35;
+    }
+    const carouselMat = carouselMaterialRef.current;
+    if (carouselMat) {
+      carouselMat.reflectivity = reflectionIntensity ?? 0.35;
     }
     const glassMat = glassMaterialRef.current;
     if (glassMat) {
@@ -824,6 +952,14 @@ function Macbook({
         mat.needsUpdate = true;
       }
       mat.envMapRotation.copy(r3fScene.environmentRotation);
+    }
+    const carouselMat = carouselMaterialRef.current;
+    if (carouselMat) {
+      if (carouselMat.envMap !== r3fScene.environment) {
+        carouselMat.envMap = r3fScene.environment;
+        carouselMat.needsUpdate = true;
+      }
+      carouselMat.envMapRotation.copy(r3fScene.environmentRotation);
     }
     const glassMat = glassMaterialRef.current;
     if (glassMat) {
@@ -875,6 +1011,51 @@ function Macbook({
       : autoAngleRef.current;
     if (groupRef.current) {
       groupRef.current.rotation.y = THREE.MathUtils.degToRad(modelRotationY ?? 0) + swing;
+    }
+  });
+
+  // Reloj del carrusel: mismo patron que CinematicRig (Cinematic.jsx) --
+  // reloj propio en un ref, nunca en estado de React, para no re-renderizar
+  // a 60fps. Cada imagen se queda quieta "holdDur" segundos y despues
+  // transiciona a la siguiente en "transitionDur" (parte del mismo slot, no
+  // tiempo extra): shot total = carouselDurationSec, loop infinito con wrap.
+  useFrame((_, rawDelta) => {
+    if (!carouselActive || !carouselTextures?.length) return;
+    invalidate();
+    const clock = carouselClockRef.current;
+    // Mismo clamp que CinematicRig: un frame lento (tab sin foco, jank de
+    // carga) no debe poder saltar de golpe varias imagenes.
+    const delta = Math.min(rawDelta, 0.1);
+    clock.elapsed += delta;
+
+    const total = Math.max(carouselDurationSec ?? 4, 0.5);
+    const transitionDur = Math.min(0.7, total * 0.4);
+    const holdDur = Math.max(total - transitionDur, 0.05);
+
+    if (clock.elapsed >= total) {
+      clock.elapsed -= total;
+      clock.index = (clock.index + 1) % carouselTextures.length;
+    }
+
+    const linearProgress =
+      clock.elapsed > holdDur
+        ? THREE.MathUtils.clamp((clock.elapsed - holdDur) / transitionDur, 0, 1)
+        : 0;
+    // easeInOutExpo en vez de lineal: arranca y termina casi en seco y
+    // acelera fuerte en el medio -- la transicion se SIENTE con mas punch,
+    // en vez de un barrido a velocidad constante.
+    const progress = EASINGS.inOutExpo(linearProgress);
+    const nextIndex = (clock.index + 1) % carouselTextures.length;
+
+    const mat = carouselMaterialRef.current;
+    if (mat) {
+      mat.map = carouselTextures[clock.index];
+      const shader = mat.userData.shader;
+      if (shader) {
+        shader.uniforms.mapB.value = carouselTextures[nextIndex];
+        shader.uniforms.uProgress.value = progress;
+        shader.uniforms.uTransitionType.value = carouselTransitionType ?? 0;
+      }
     }
   });
 
