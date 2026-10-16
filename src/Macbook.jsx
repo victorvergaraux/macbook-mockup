@@ -14,6 +14,28 @@ import fingerprintRoughnessUrl from '../src/macbook/PBR/optimized/imperfection_r
 import fingerprintNormalUrl from '../src/macbook/PBR/optimized/imperfection_normal.webp?url';
 import fingerprintColorUrl from '../src/macbook/PBR/optimized/imperfection_color.webp?url';
 import fingerprintOpacityMapUrl from '../src/macbook/PBR/optimized/imperfection_opacity.webp?url';
+// Placeholders de pantalla (fondo random detras del texto "Arrastra aqui tu
+// diseno" mientras no hay imagen/video cargado) -- ya optimizados a WebP
+// (~50-210KB c/u, antes pesaban hasta 9.8MB en PNG), import `?url` normal
+// (igual que el resto de texturas de arriba): solo trae el string de la URL
+// hasheada, el archivo en si lo pide el browser al dibujarlo, no al importar.
+import placeholderBauhaus1Url from './macbook/textures/bauhaus-grid_32J37F_mbp16_3456x2234.webp?url';
+import placeholderBauhaus2Url from './macbook/textures/bauhaus-grid_5BFDPV_mbp16_3456x2234.webp?url';
+import placeholderBauhaus3Url from './macbook/textures/bauhaus-grid_JWQM0Q_mbp16_3456x2234.webp?url';
+import placeholderLiquid1Url from './macbook/textures/liquid-bento_AST5_mbp14_3024x1964_tmz0g9.webp?url';
+import placeholderLiquid2Url from './macbook/textures/liquid-bento_SNUP_mbp14_3024x1964_tmz0fu.webp?url';
+import placeholderBlueprint1Url from './macbook/textures/mat-blueprint_S8F3ZT_mbp14_3024x1964_kqnt.webp?url';
+import placeholderBlueprint2Url from './macbook/textures/mat-blueprint_X8QW8U_mbp14_3024x1964_mo9e.webp?url';
+
+const PLACEHOLDER_IMAGES = [
+  placeholderBauhaus1Url,
+  placeholderBauhaus2Url,
+  placeholderBauhaus3Url,
+  placeholderLiquid1Url,
+  placeholderLiquid2Url,
+  placeholderBlueprint1Url,
+  placeholderBlueprint2Url,
+];
 
 useGLTF.preload(modelUrl);
 
@@ -142,9 +164,16 @@ function buildVignetteAlphaCanvas(image, { tileCount, radius, intensity }) {
 }
 
 /**
- * Placeholder de pantalla apagada: fondo oscuro + texto centrado invitando
- * a soltar una imagen. Se genera una sola vez (canvas estatico, sin
- * controles) y se reemplaza por la textura del usuario en cuanto carga una.
+ * Placeholder de pantalla apagada: una de las imagenes de PLACEHOLDER_IMAGES
+ * (elegida al azar, una vez por carga de pagina) de fondo + velo oscuro +
+ * texto centrado invitando a soltar una imagen/video propios. Se genera una
+ * sola vez (canvas estatico, sin controles) y se reemplaza por la textura
+ * del usuario en cuanto carga una.
+ *
+ * El dibujo pasa en dos pasos: el canvas sale YA con fondo solido + texto
+ * (sincronico, primer frame sin flash en blanco) y, cuando la imagen de
+ * fondo termina de cargar (async), se re-dibuja todo encima en el MISMO
+ * canvas/textura (`texture.needsUpdate = true` de nuevo).
  */
 function buildPlaceholderScreenTexture() {
   const canvas = document.createElement('canvas');
@@ -152,20 +181,42 @@ function buildPlaceholderScreenTexture() {
   canvas.height = 1000;
   const ctx = canvas.getContext('2d');
 
+  function drawText() {
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = 'bold 64px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Arrastra aquí tu diseño', canvas.width / 2, canvas.height / 2);
+  }
+
   ctx.fillStyle = '#111214';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.font = 'bold 64px system-ui, -apple-system, Segoe UI, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('Arrastra aquí tu diseño', canvas.width / 2, canvas.height / 2);
+  drawText();
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   // Mismo criterio que useScreenTexture: UV de glTF con origen arriba-izq.
   texture.flipY = false;
   texture.needsUpdate = true;
+
+  const url = PLACEHOLDER_IMAGES[Math.floor(Math.random() * PLACEHOLDER_IMAGES.length)];
+  const bg = new Image();
+  bg.onload = () => {
+    // "cover": escala al lado mayor y recorta centrado, sin deformar.
+    const scale = Math.max(canvas.width / bg.width, canvas.height / bg.height);
+    const drawW = bg.width * scale;
+    const drawH = bg.height * scale;
+    ctx.drawImage(bg, (canvas.width - drawW) / 2, (canvas.height - drawH) / 2, drawW, drawH);
+    // Velo oscuro: sin esto el texto queda ilegible sobre imagenes claras o
+    // con mucho detalle (son fondos de diseno real, no pensados como fondo
+    // de un texto encima).
+    ctx.fillStyle = 'rgba(10,10,12,0.55)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawText();
+    texture.needsUpdate = true;
+  };
+  bg.src = url;
+
   return texture;
 }
 

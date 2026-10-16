@@ -22,17 +22,37 @@ import {
   ToneMapping,
 } from '@react-three/postprocessing';
 import { BlendFunction, ToneMappingMode } from 'postprocessing';
-import { useControls, button, buttonGroup, folder, Leva } from 'leva';
+import { useTweak, button, buttonGroup, folder, separator, collapseAllFolders } from './useTweak.js';
 import Macbook from './Macbook.jsx';
 import { useScreenTexture } from './useScreenTexture.js';
 import { useScreenVideoTexture } from './useScreenVideoTexture.js';
 import { UploadCloud } from 'lucide-react';
 import { exportCanvas } from './exporter.js';
-import ExportPanel, { ASPECT_PRESETS } from './ExportPanel.jsx';
 import { CinematicRig } from './Cinematic.jsx';
 import { SHOTS, CINEMATIC_CONFIG } from './shots.js';
 
 const ENV_PRESETS = ['studio', 'city', 'sunset', 'dawn', 'warehouse', 'apartment', 'forest', 'lobby'];
+
+// Calidades de exportacion de video -- MediaRecorder codifica SIEMPRE con
+// perdida (VP9/VP8/H264), no hay "sin compresion" real en esta API; "max" es
+// el bitrate mas alto razonable (compresion casi imperceptible), no cero.
+const VIDEO_QUALITY_PRESETS = {
+  max: { fps: 60, videoBitsPerSecond: 50_000_000 },
+  medium: { fps: 30, videoBitsPerSecond: 15_000_000 },
+  low: { fps: 30, videoBitsPerSecond: 4_000_000 },
+};
+
+// 'real' = sin recorte, tal cual el canvas actual (ver exporter.js). El
+// resto son [ancho, alto] para cropToAspect (recorte al centro, sin upscale).
+// Antes vivia en ExportPanel.jsx (panel DOM aparte, ver folder 'Export' de
+// abajo que lo reemplaza entero).
+const ASPECT_PRESETS = [
+  { id: 'real', label: 'Real', ratio: null },
+  { id: '1:1', label: '1:1', ratio: [1, 1] },
+  { id: '16:9', label: '16:9', ratio: [16, 9] },
+  { id: '9:16', label: '9:16', ratio: [9, 16] },
+  { id: '4:5', label: '4:5', ratio: [4, 5] },
+];
 
 // drei's <Environment preset="..."> descarga el HDRI de un CDN externo
 // (polyhaven via pmndrs), bloqueante y fuera de nuestro control de cache. El
@@ -43,16 +63,6 @@ const ENV_PRESETS = ['studio', 'city', 'sunset', 'dawn', 'warehouse', 'apartment
 // no vale la pena empacarlos todos).
 const LOCAL_HDRI_PRESET = 'studio';
 const localHdriPromise = import('@pmndrs/assets/hdri/studio.exr.js').then((m) => m.default);
-
-// Leva registra `folderSettings.render` UNA SOLA VEZ (la primera llamada que
-// crea el path del folder) y nunca la vuelve a leer del closure de React.
-// Con StrictMode, el render inicial de React se ejecuta dos veces y la
-// invocacion descartada puede ser la que gana ese registro -- un useRef
-// dentro del componente no sirve porque cada pase de StrictMode crea su
-// propio ref. Una variable de modulo si es la misma celda para ambos pases,
-// asi que el predicate siempre lee el valor mas reciente sin importar cual
-// pase "gano" el registro en Leva.
-let isVideoFlag = false;
 
 // Direcciones normalizadas de camara por vista; Bounds calcula la distancia real
 // (fit) segun el tamano del modelo, aqui solo definimos el angulo.
@@ -393,6 +403,58 @@ function CaptureRig({ registerCapture, videoEl }) {
 
         if (wasPlaying) videoEl.play().catch(() => {});
       },
+
+      // Grava `durationMs` del canvas WebGL con MediaRecorder y descarga el
+      // resultado como .webm. Pensada para usarse mientras la cinematica
+      // esta corriendo (frameloop="demand" sigue pintando frames nuevos
+      // porque CinematicRig llama invalidate() en cada uno de los suyos --
+      // sin eso, captureStream() grabaria el mismo frame congelado).
+      // videoBitsPerSecond: MediaRecorder SIEMPRE codifica con un codec con
+      // perdida (VP9/VP8/H264) -- no existe un modo "sin compresion" real en
+      // esta API del navegador. "max" solo pide el bitrate mas alto
+      // razonable (compresion casi imperceptible), no compresion cero.
+      exportVideo: ({ durationMs = 15000, fps = 30, videoBitsPerSecond } = {}) => {
+        const canvas = gl.domElement;
+        if (typeof canvas.captureStream !== 'function' || typeof window.MediaRecorder === 'undefined') {
+          window.alert('Este navegador no soporta exportar video (captureStream/MediaRecorder no disponibles).');
+          return Promise.resolve();
+        }
+        const stream = canvas.captureStream(fps);
+        const mimeCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+        const mimeType = mimeCandidates.find((m) => window.MediaRecorder.isTypeSupported?.(m)) ?? '';
+        const recorderOptions = {};
+        if (mimeType) recorderOptions.mimeType = mimeType;
+        if (videoBitsPerSecond) recorderOptions.videoBitsPerSecond = videoBitsPerSecond;
+        const recorder = new window.MediaRecorder(
+          stream,
+          Object.keys(recorderOptions).length ? recorderOptions : undefined
+        );
+        const chunks = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size) chunks.push(e.data);
+        };
+        const stopped = new Promise((resolve) => {
+          recorder.onstop = resolve;
+        });
+        recorder.start();
+        return new Promise((resolve) => {
+          setTimeout(async () => {
+            recorder.stop();
+            await stopped;
+            stream.getTracks().forEach((track) => track.stop());
+            const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `cinematic-${Date.now()}.webm`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+            resolve();
+          }, durationMs);
+        });
+      },
     });
   }, [gl, size, scene, camera, registerCapture, videoEl]);
 
@@ -541,12 +603,16 @@ export default function App() {
     captureApiRef.current = api;
   }, []);
 
-  // ---- Leva controls ----
-  // Flat, single-level folders only (no nested sub-groups): keeps the panel
-  // easy to scan. Short labels throughout; everything in English.
-  const { zoomMargin, fov, view } = useControls(
-    'Camera',
+  // ---- Panel: 4 grupos pedidos (Scene/Design/Visual/Cinematic), sin
+  // sub-folders colapsables -- varias llamadas comparten el mismo folderTitle
+  // y useTweak las funde en una sola lista plana (ver getFolder en
+  // useTweak.js); cada sub-seccion original queda marcada con un separator()
+  // (linea + rotulo de solo lectura, lo mas parecido a un titulo que
+  // Tweakpane permite sin crear un folder anidado de verdad).
+  const [{ zoomMargin, fov, view }] = useTweak(
+    'Scene',
     {
+      _sepCamera: separator('Camera'),
       view: { value: 'iso', options: ['iso', 'isoLeft', 'frontal', 'top'] },
       zoomMargin: { value: 1.3, min: 0.3, max: 3, step: 0.05, label: 'framing' },
       fov: { value: 12, min: 12, max: 45, step: 1, label: 'fov' },
@@ -568,15 +634,21 @@ export default function App() {
       }, {}),
     []
   );
-  useControls('Camera Presets', cameraPresetSchema, { render: () => false });
+  useTweak('Camera Presets', cameraPresetSchema, { hidden: true });
 
   const [cameraRequest, setCameraRequest] = useState(null);
 
-  const [{ reflectionIntensity, reflectionRoughness }, setScreenReflection] = useControls(
-    'Screen',
+  const [{ reflectionIntensity, reflectionRoughness }, setScreenReflection] = useTweak(
+    'Design',
     () => ({
-      reflectionIntensity: { value: 0.56, min: 0, max: 1, step: 0.01, label: 'reflection' },
-      reflectionRoughness: { value: 0.25, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
+      _sepScreen: separator('Screen'),
+      // Subido (0.56->0.9, 0.25->0.02) a pedido: reflejo del HDRI lo mas
+      // nitido posible -- clearcoat/clearcoatRoughness del vidrio se atan a
+      // estos dos valores (ver Macbook.jsx), 0 de roughness = espejo nitido.
+      // El otro factor que afecta nitidez es la resolucion del envMap (ver
+      // prop `resolution` de <Environment> en el JSX de mas abajo).
+      reflectionIntensity: { value: 0.9, min: 0, max: 1, step: 0.01, label: 'reflection' },
+      reflectionRoughness: { value: 0.02, min: 0, max: 1, step: 0.01, label: 'refl. roughness' },
     }),
     { collapsed: true }
   );
@@ -594,17 +666,21 @@ export default function App() {
   // siempre, para cualquier width/height -- ver comentario ahi junto al
   // calculo de anchorX/anchorY): en 0 la imagen queda pegada arriba-
   // izquierda sin importar cuanto se escale; +/- la corre desde ese punto.
-  const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useControls(
+  const [{ imgScaleX, imgScaleY, offsetX, offsetY, imgRotation, brightness }, setDesign] = useTweak(
     'Design',
     () => ({
-      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.25, label: 'width' },
-      imgScaleY: { value: 1, min: 0.1, max: scaleYMax, step: 0.25, label: 'height' },
+      _sepDesign: separator('Design'),
+      imgScaleX: { value: 1, min: 0.1, max: 3, step: 0.01, label: 'width' },
+      imgScaleY: { value: 1, min: 0.1, max: scaleYMax, step: 0.01, label: 'height' },
       offsetX: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset x' },
       offsetY: { value: 0, min: -1, max: 1, step: 0.01, label: 'offset y' },
       imgRotation: { value: 0, min: -180, max: 180, step: 1, label: 'rotation' },
       brightness: { value: 1.7, min: 0.2, max: 3, step: 0.05, label: 'brightness' },
     }),
-    { collapsed: false },
+    // Colapsado por default (igual que el resto de folders) para que el
+    // panel arranque compacto -- sigue siendo el primero de la lista, un
+    // click lo abre.
+    { collapsed: true },
     [scaleYMax]
   );
 
@@ -658,31 +734,33 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screenTexture, isVideo, screenAspect, scaleYMax]);
 
-  isVideoFlag = isVideo;
-
   // Controles solo tienen efecto visible cuando hay un video cargado
   // (isVideo): sin sentido para una imagen estatica.
-  const [{ playing, playbackRate, muted }, setVideoControls] = useControls(
-    'Video',
+  const [{ playing, playbackRate, muted }, , videoControlsRef] = useTweak(
+    'Design',
     () => ({
+      _sepVideo: separator('Video'),
       playing: { value: true, label: 'playing' },
       playbackRate: { value: 1, min: 0.25, max: 2, step: 0.05, label: 'speed' },
       // Desmutear puede bloquear el autoplay al recargar (politica del
       // navegador de gestos de usuario), por eso el default queda en true.
       muted: { value: true, label: 'muted (desmutear puede bloquear autoplay)' },
     }),
-    { collapsed: true, render: () => isVideoFlag }
+    { collapsed: true }
   );
 
-  // El panel de Leva solo recalcula que folders mostrar cuando su store
-  // interno cambia de estado (ver el subscribe a getVisiblePaths en
-  // leva.esm.js). Mutar isVideoFlag no dispara eso por si solo, asi que se
-  // fuerza un set trivial (mismo valor) en cada cambio de isVideo para que
-  // Leva vuelva a evaluar `render` con el flag ya actualizado.
+  // Folder compartido ('Design'): a diferencia de antes (un folder 'Video'
+  // propio que se ocultaba entero), aca solo se puede ocultar/mostrar los
+  // controles DE ESTA llamada puntualmente -- el resto de 'Design' (Screen,
+  // Design, Model) tiene que seguir visible siempre. Incluye el separator
+  //('_sepVideo'): sin esto quedaba un rotulo "Video" huerfano, sin nada
+  // debajo, cuando no hay video cargado.
   useEffect(() => {
-    setVideoControls({ muted });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isVideo]);
+    Object.entries(videoControlsRef.current ?? {}).forEach(([key, ctrl]) => {
+      if (key === '__folder') return;
+      ctrl.hidden = !isVideo;
+    });
+  }, [isVideo, videoControlsRef]);
 
   useEffect(() => {
     if (!videoEl) return;
@@ -711,9 +789,10 @@ export default function App() {
   const [
     { modelRotationY, lidAngle, autoRotate, autoRotateSpeed, rotateSway, rotateRange },
     setModel,
-  ] = useControls(
-    'Model',
+  ] = useTweak(
+    'Design',
     () => ({
+      _sepModel: separator('Model'),
       modelRotationY: { value: 0, min: -180, max: 180, step: 1, label: 'rotation y' },
       // Rango recalibrado para el GLB actual (nodo "screen" con pivot propio
       // en la bisagra, ver Macbook.jsx): 0 = tapa exactamente vertical (90
@@ -729,7 +808,7 @@ export default function App() {
       // cinematica: el giro de 360 sin fin (sway off) queda como opcion
       // manual, no como default.
       rotateSway: { value: true, label: 'sway' },
-      rotateRange: { value: 30, min: 5, max: 40, step: 1, label: 'pan range' },
+      rotateRange: { value: 20, min: 5, max: 40, step: 1, label: 'pan range' },
     }),
     { collapsed: true }
   );
@@ -738,7 +817,7 @@ export default function App() {
   const [
     { metalTiling, metalRoughnessAmount, metalMetalnessAmount, metalNormalIntensity },
     setMetal,
-  ] = useControls(
+  ] = useTweak(
     'Metal',
     () => ({
       metalTiling: { value: 3, min: 1, max: 10, step: 1, label: 'tiling' },
@@ -746,16 +825,16 @@ export default function App() {
       metalMetalnessAmount: { value: 0.95, min: 0, max: 2, step: 0.05, label: 'metalness' },
       metalNormalIntensity: { value: 0, min: 0, max: 3, step: 0.05, label: 'normal' },
     }),
-    { render: () => false }
+    { hidden: true }
   );
 
   // Solo debug: revisar topologia de la malla.
-  const { wireframe } = useControls(
+  const [{ wireframe }] = useTweak(
     'Debug',
     {
       wireframe: { value: false, label: 'wireframe' },
     },
-    { render: () => false }
+    { hidden: true }
   );
 
   // Smudge overlay (separate glass layer over the image material). Folder
@@ -774,9 +853,15 @@ export default function App() {
       vignetteIntensity,
     },
     setFingerprint,
-  ] = useControls(
-    'Screen',
+  ] = useTweak(
+    'Design',
     () => ({
+      // Esta llamada se registra DESPUES que Model en el folder fusionado
+      // 'Design' (orden = orden de declaracion de los hooks en el archivo,
+      // no se reordeno para no arriesgar nada mas arriba) -- lleva su propio
+      // separator en vez de reusar el de 'Screen' de mas arriba, porque en
+      // la lista final queda lejos de ese bloque, pegado debajo de Model.
+      _sepFingerprints: separator('Screen (fingerprints)'),
       imperfectionEnabled: { value: true, label: 'Fingerprints' },
       fingerprintTiling: { value: 1, min: 0.2, max: 5, step: 1.0, label: 'tiling' },
       fingerprintOpacity: { value: 0.02, min: 0, max: 1, step: 0.01, label: 'opacity' },
@@ -792,15 +877,16 @@ export default function App() {
   const [
     { envPreset, envIntensity, bgColor, envAsBackground, blur, envRotationY },
     setEnvironment,
-  ] = useControls(
-    'Environment',
+  ] = useTweak(
+    'Scene',
     () => ({
+      _sepEnvironment: separator('Environment'),
       envPreset: { value: 'studio', options: ENV_PRESETS, label: 'preset' },
       envIntensity: { value: 0.65, min: 0, max: 3, step: 0.05, label: 'intensity' },
-      bgColor: { value: '#0080ff', label: 'bg color' },
+      bgColor: { value: '#0d0f10', label: 'bg color', color: true },
       envAsBackground: { value: false, label: 'hdri bg' },
       blur: { value: 0.8, min: 0.2, max: 1, step: 0.05, label: 'blur' },
-      envRotationY: { value: 181, min: 0, max: 360, step: 1, label: 'hdri rotation' },
+      envRotationY: { value: 80, min: 0, max: 360, step: 1, label: 'hdri rotation' },
     }),
     { collapsed: true }
   );
@@ -808,14 +894,15 @@ export default function App() {
   const [
     { dofEnabled, focusDistance, focusRange, bokehScale, bloomEnabled, bloomIntensity, bloomThreshold },
     setFocus,
-  ] = useControls(
-    'Focus',
+  ] = useTweak(
+    'Visual',
     () => ({
+      _sepFocus: separator('Focus'),
       dofEnabled: { value: false, label: 'dof' },
       focusDistance: { value: 1, min: 0.05, max: 5, step: 0.01, label: 'distance' },
       focusRange: { value: 0.3, min: 0.02, max: 3, step: 0.01, label: 'range' },
       bokehScale: { value: 3, min: 0, max: 10, step: 0.1, label: 'bokeh' },
-      bloomEnabled: { value: true, label: 'bloom' },
+      bloomEnabled: { value: false, label: 'bloom' },
       bloomThreshold: { value: 1.0, min: 0.5, max: 1.5, step: 0.01, label: 'threshold' },
       bloomIntensity: { value: 0.25, min: 0, max: 2, step: 0.05, label: 'intensity' },
     }),
@@ -824,9 +911,10 @@ export default function App() {
 
   // Ambient occlusion por pantalla (N8AO): oscurece recovecos de contacto
   // (teclas, bisagra, ranuras) que el IBL solo nunca produce.
-  const [{ aoEnabled, aoIntensity, aoRadius, aoDistanceFalloff }, setAO] = useControls(
-    'AO',
+  const [{ aoEnabled, aoIntensity, aoRadius, aoDistanceFalloff }, setAO] = useTweak(
+    'Visual',
     () => ({
+      _sepAO: separator('AO'),
       aoEnabled: { value: false, label: 'enabled' },
       aoIntensity: { value: 3, min: 0, max: 10, step: 0.1, label: 'intensity' },
       aoRadius: { value: 0.4, min: 0.01, max: 2, step: 0.01, label: 'radius' },
@@ -855,11 +943,12 @@ export default function App() {
       colorContrast,
     },
     setGrade,
-  ] = useControls(
-    'Grade',
+  ] = useTweak(
+    'Visual',
     () => ({
+      _sepGrade: separator('Grade'),
       toneMappingMode: {
-        value: 'aces',
+        value: 'neutral',
         options: { AgX: 'agx', 'ACES Filmic': 'aces', Neutral: 'neutral' },
         label: 'tone map',
       },
@@ -894,39 +983,61 @@ export default function App() {
 
   // Toggle visible (a diferencia del resto de ajustes finos de sombra, mas
   // abajo, que quedan ocultos del panel).
-  const { shadowEnabled } = useControls(
-    'Shadow',
+  const [{ shadowEnabled }] = useTweak(
+    'Visual',
     {
+      _sepShadow: separator('Shadow'),
       shadowEnabled: { value: false, label: 'enabled' },
     },
     { collapsed: true }
   );
 
-  const [{ shadowOpacity, shadowBlur, shadowScale }, setShadow] = useControls(
-    'Shadow',
+  const [{ shadowOpacity, shadowBlur, shadowScale }, setShadow] = useTweak(
+    'Visual',
     () => ({
       shadowOpacity: { value: 1, min: 0, max: 1, step: 0.01 },
       shadowBlur: { value: 0.09, min: 0, max: 6, step: 0.01 },
       shadowScale: { value: 7, min: 4, max: 30, step: 1 },
     }),
-    { render: () => false }
+    { hideControls: true }
   );
 
-  // El export ya no vive en Leva: es un panel propio en DOM (ExportPanel,
-  // esquina inferior izquierda -- ver JSX mas abajo). Leva solo conserva un
-  // toggle para ocultarlo por completo.
-  const { hideExportUI } = useControls(
+  // Folder 'Export': reemplaza entero al panel DOM aparte que habia antes
+  // (ExportPanel.jsx, pastilla flotante abajo-izquierda) -- mismos controles,
+  // ahora como Tweakpane, con 'hide UI' de vuelta adentro del grupo (en vez
+  // de suelto en la raiz, como habia quedado en el paso anterior).
+  const exportActionsRef = useRef({});
+  const [
+    { exportAspect, exportFormat, exportQuality, exportTransparentBg, hideExportUI },
+    ,
+    exportControlsRef,
+  ] = useTweak(
     'Export',
-    {
+    () => ({
+      exportAspect: {
+        value: 'real',
+        options: { Real: 'real', '1:1': '1:1', '16:9': '16:9', '9:16': '9:16', '4:5': '4:5' },
+        label: 'aspect ratio',
+      },
+      exportFormat: { value: 'png', options: { PNG: 'png', JPG: 'jpg' }, label: 'format' },
+      exportQuality: { value: 1, min: 0.5, max: 1, step: 0.01, label: 'jpg quality' },
+      exportTransparentBg: { value: false, label: 'transparent bg (png)' },
+      'Download image': button(() => exportActionsRef.current.handleExportImage?.()),
       hideExportUI: { value: false, label: 'hide UI' },
-    },
+    }),
     { collapsed: true }
   );
 
-  const [exportFormat, setExportFormat] = useState('png');
-  const [exportQuality, setExportQuality] = useState(1);
-  const [exportTransparentBg, setExportTransparentBg] = useState(false);
-  const [exportAspect, setExportAspect] = useState('real');
+  // exportQuality solo aplica a JPG; exportTransparentBg solo a PNG -- se
+  // ocultan segun el formato elegido en vez de mostrarse siempre sin efecto
+  // (mismo patron que el folder 'Video', condicionado por isVideo).
+  useEffect(() => {
+    const qualityCtrl = exportControlsRef.current?.exportQuality;
+    const transparentCtrl = exportControlsRef.current?.exportTransparentBg;
+    if (qualityCtrl) qualityCtrl.hidden = exportFormat !== 'jpg';
+    if (transparentCtrl) transparentCtrl.hidden = exportFormat !== 'png';
+  }, [exportFormat, exportControlsRef]);
+
   const [isExporting, setIsExporting] = useState(false);
 
   // ---- Cinematica ----
@@ -983,20 +1094,33 @@ export default function App() {
     prevLoadingActiveRef.current = loadingActive;
   }, [loadingActive]);
   const cinematicActionsRef = useRef({});
-  // Boton Play/Stop del panel Leva: mismo condicional `cinematicActive` de
-  // siempre (efectos de Cinematic.jsx, snapshot/restore, grid, etc. no
-  // cambian), solo que ahora vive en useState en vez de en el value de un
-  // control boolean de Leva -- asi el label del boton puede leer su propio
-  // valor actual (ver deps de useControls mas abajo, que fuerzan a Leva a
-  // regenerar el boton -- y por lo tanto su label -- cada vez que cambia).
+  // Estado del modo cinematico: dispara los efectos de snapshot/restore,
+  // grid, etc. de mas abajo. El boton Play/Stop del panel lee este valor
+  // via el efecto que le cambia el `.title` (ver cinematicControlsRef).
   const [cinematicActive, setCinematicActive] = useState(false);
-  // Panel Leva controlado: se compacta solo al arrancar la cinematica (para
-  // ver la escena sin controles al lado) pero se puede reabrir a mano en
-  // cualquier momento -- no se fuerza a re-expandir al parar, queda como el
-  // usuario lo haya dejado.
-  const [levaCollapsed, setLevaCollapsed] = useState(true);
+  // true durante el delay de arranque (entre click en Play y el momento en
+  // que la cinematica/video de verdad empiezan) -- separado de
+  // cinematicActive porque el reset a 0 del clock de CinematicRig solo debe
+  // pasar cuando de verdad arranca, no apenas se clickea Play.
+  const [cinematicPending, setCinematicPending] = useState(false);
+  const [isExportingVideo, setIsExportingVideo] = useState(false);
+  // 0..1, solo mientras isExportingVideo -- barra de progreso DOM (fuera del
+  // <canvas>, ver JSX mas abajo), nunca aparece en el .webm exportado porque
+  // captureStream() solo graba los pixeles del canvas, no el resto de la pagina.
+  const [videoExportProgress, setVideoExportProgress] = useState(0);
+  const playTimeoutRef = useRef(null);
+  useEffect(
+    () => () => {
+      if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
+    },
+    []
+  );
+  // Panel compactado solo al arrancar la cinematica (para ver la escena sin
+  // controles al lado) -- no se fuerza a re-expandir al parar, queda como el
+  // usuario lo haya dejado (Tweakpane no tiene "re-expandir todo" nativo,
+  // tampoco hacia falta antes con Leva).
   useEffect(() => {
-    if (cinematicActive) setLevaCollapsed(true);
+    if (cinematicActive) collapseAllFolders();
   }, [cinematicActive]);
 
   const cinematicShotOptions = useMemo(() => {
@@ -1009,28 +1133,34 @@ export default function App() {
   }, [shots]);
 
   // El folder completo se deja visible mientras se capturan tomas. Una vez
-  // pegado el resultado de "Copy shots.js" en src/shots.js, cambiar
-  // `{ collapsed: true }` de abajo por `{ render: () => false }` (mismo
-  // patron que el folder oculto 'Camera Presets' mas arriba) para ocultar el
-  // panel sin afectar en nada la reproduccion, que siempre lee de `shots`.
+  // pegado el resultado de "Copy shots.js" en src/shots.js, agregar
+  // `hidden: true` a las options de abajo (mismo patron que 'Camera Presets'
+  // mas arriba) para ocultar el panel sin afectar en nada la reproduccion,
+  // que siempre lee de `shots`.
   const [
-    { gridEnabled, lidDurationSec, shotDurationSec, shotSelect },
+    { gridEnabled, lidDurationSec, shotDurationSec, startDelaySec, videoQuality, shotSelect },
     setCinematic,
-  ] = useControls(
+    cinematicControlsRef,
+  ] = useTweak(
     'Cinematic (Advanced)',
     () => ({
-      // Dos botones de KEY FIJA (nunca cambian) en vez de una key dinamica:
-      // Leva ordena las filas por el orden en que cada key se vio POR
-      // PRIMERA VEZ y nunca lo actualiza, asi que una key dinamica ('Play'
-      // <-> 'Stop') saltaba de fila cada click. Con key fija ambos botones
-      // quedan anclados arriba, en las primeras dos filas, para siempre.
-      // Cual de los dos se ve se resuelve fuera de Leva, por DOM (ver
-      // useEffect `syncPlayStopButtons` mas abajo) porque `render` por
-      // control tampoco esta soportado para botones en Leva (solo a nivel
-      // folder completo, como 'Camera Presets' mas abajo) -- confirmado
-      // inspeccionando el store de Leva en runtime.
-      '▶ Play': button(() => setCinematicActive(true)),
-      '■ Stop': button(() => setCinematicActive(false)),
+      // Un solo boton de key fija (a diferencia de Leva, Tweakpane permite
+      // cambiar el `.title` de un boton ya creado en caliente -- ver efecto
+      // mas abajo que lo relabelea segun cinematicActive/cinematicPending,
+      // sin el hack de dos botones + MutationObserver que hacia falta antes).
+      // Lee el handler mas reciente via cinematicActionsRef para no tener
+      // que agregar handlePlay/handleStop al array de deps de este useTweak
+      // -- eso recrearia el schema entero (y resetearia el collapse del
+      // folder) en cada cambio de startDelaySec/videoEl.
+      cinematicPlayToggle: button(() => cinematicActionsRef.current.handlePlayToggle?.(), {
+        label: '▶ Play',
+      }),
+      videoQuality: {
+        value: 'medium',
+        options: { 'Max (60fps)': 'max', 'Medium (30fps)': 'medium', 'Low (30fps)': 'low' },
+        label: 'video quality',
+      },
+      'Export video (15s)': button(() => cinematicActionsRef.current.handleExportVideo?.()),
       // Guia de encuadre (grid de tercios + cruz central): se dibuja en DOM,
       // fuera del <Canvas> (ver CompositionGrid mas abajo), y se oculta sola
       // mientras cinematicActive este prendido -- no hace falta snapshot ni
@@ -1039,7 +1169,9 @@ export default function App() {
       // (`gridEnabled && !cinematicActive`), asi que vuelve a aparecer sola
       // al apagar la cinematica si seguia activada. Fuera de 'Playback' (key
       // propia, top-level) para que quede pegado justo debajo de Play/Stop.
-      gridEnabled: { value: false, label: 'grid' },
+      // Default true: la guia de encuadre debe verse apenas se entra al
+      // panel cinematico, no hace falta prenderla a mano cada vez.
+      gridEnabled: { value: true, label: 'grid' },
       Playback: folder({
         lidDurationSec: {
           value: CINEMATIC_CONFIG.lidDuration,
@@ -1054,6 +1186,17 @@ export default function App() {
           max: 15,
           step: 0.1,
           label: 'shot duration (s)',
+        },
+        // Delay antes de que Play de verdad arranque la cinematica (y el
+        // video de pantalla, si hay uno cargado) -- tiempo para que quien
+        // este grabando la pantalla llegue a cuadro. Tambien lo usa "Export
+        // video (15s)".
+        startDelaySec: {
+          value: 2,
+          min: 0,
+          max: 10,
+          step: 0.5,
+          label: 'start delay (s)',
         },
       }),
       'Shot Capture': folder({
@@ -1079,49 +1222,15 @@ export default function App() {
     [cinematicShotOptions]
   );
 
-  // Los botones Play/Stop de arriba tienen key fija (ver comentario en el
-  // schema): cual se ve se decide aca por DOM en vez de por Leva, porque
-  // Leva no soporta `render` condicional por control individual (solo por
-  // folder completo). MutationObserver porque el folder "Cinematic
-  // (Advanced)" arranca colapsado -- los botones no existen en el DOM hasta
-  // que el usuario lo abre, y hay que re-aplicar la visibilidad en ese
-  // momento, no solo al cambiar `cinematicActive`.
+  // Relabel directo del boton (Tweakpane soporta mutar `.title` en caliente,
+  // a diferencia de Leva -- ver comentario en el schema de arriba).
+  // cinematicPending (delay de arranque) cuenta como "corriendo" para este
+  // label: debe decir "Stop" (y cancelar el delay si se clickea) desde el
+  // click en Play, no solo una vez que el clock de verdad arranca.
   useEffect(() => {
-    // Sigue en document.body (no un contenedor propio de Leva): el prop
-    // `className="leva-container"` de <Leva> mas abajo NO llega a aplicarse
-    // al DOM real en esta version de la libreria (verificado en runtime --
-    // el arbol del panel solo trae las clases hasheadas internas de Leva,
-    // "leva-container" no aparece en ningun nodo), asi que acotar el
-    // MutationObserver a ese selector lo dejaba sin root donde observar y
-    // rompia el toggle Play/Stop por completo (los dos quedaban visibles a
-    // la vez). Lo que SI se optimiza aca: coalescer con requestAnimationFrame
-    // -- Leva muta su DOM en cada tick de CUALQUIER slider, y sin esto el
-    // callback (con su recorrido de document.querySelectorAll('button'))
-    // corria una vez por mutacion en vez de una vez por frame.
-    let rafId = null;
-    const applyVisibility = () => {
-      rafId = null;
-      document.querySelectorAll('button').forEach((btn) => {
-        if (btn.textContent === '▶ Play') {
-          btn.parentElement.style.display = cinematicActive ? 'none' : '';
-        } else if (btn.textContent === '■ Stop') {
-          btn.parentElement.style.display = cinematicActive ? '' : 'none';
-        }
-      });
-    };
-    const scheduleApply = () => {
-      if (rafId != null) return;
-      rafId = requestAnimationFrame(applyVisibility);
-    };
-
-    applyVisibility();
-    const observer = new MutationObserver(scheduleApply);
-    observer.observe(document.body, { childList: true, subtree: true });
-    return () => {
-      observer.disconnect();
-      if (rafId != null) cancelAnimationFrame(rafId);
-    };
-  }, [cinematicActive]);
+    const btn = cinematicControlsRef.current?.cinematicPlayToggle;
+    if (btn) btn.title = cinematicActive || cinematicPending ? '■ Stop' : '▶ Play';
+  }, [cinematicActive, cinematicPending, cinematicControlsRef]);
 
   // Las tomas son poses absolutas de mundo (ver comentario en shots.js): si
   // se capturan con el modelo girado o autorrotando, la composicion no va a
@@ -1243,6 +1352,80 @@ export default function App() {
     window.alert('shots.js copiado al portapapeles. Pegalo reemplazando src/shots.js.');
   }, [shots, lidDurationSec, shotDurationSec]);
 
+  // Play: reinicia el video de pantalla (si hay uno cargado) a 0 y recien
+  // despues de `startDelaySec` arranca de verdad el video + la cinematica
+  // (setCinematicActive(true) dispara el reset del clock de CinematicRig y
+  // el snapshot/rotacion -- ver useEffect de cinematicActive mas abajo).
+  // cinematicPending prende apenas se clickea (muestra "Stop" ya mismo, por
+  // si hay que cancelar el delay) y se apaga recien cuando el delay termina.
+  // Un solo boton (Tweakpane permite relabelear en caliente, ver efecto que
+  // lo renombra Play/Stop mas arriba): si ya esta corriendo o pendiente,
+  // actua como Stop; si no, como Play.
+  const handlePlayToggle = useCallback(() => {
+    if (cinematicActive || cinematicPending) {
+      if (playTimeoutRef.current) {
+        clearTimeout(playTimeoutRef.current);
+        playTimeoutRef.current = null;
+      }
+      setCinematicPending(false);
+      setCinematicActive(false);
+      return;
+    }
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.currentTime = 0;
+    }
+    setCinematicPending(true);
+    playTimeoutRef.current = setTimeout(() => {
+      playTimeoutRef.current = null;
+      setCinematicPending(false);
+      if (videoEl) videoEl.play().catch(() => {});
+      setCinematicActive(true);
+    }, startDelaySec * 1000);
+  }, [cinematicActive, cinematicPending, videoEl, startDelaySec]);
+
+  // Arranca Play (mismo reset + delay) y, apenas la cinematica de verdad
+  // empieza, grava 15s del canvas con MediaRecorder (capturApiRef.exportVideo,
+  // ver CaptureRig) y descarga el .webm resultante.
+  const handleExportVideo = useCallback(() => {
+    if (isExportingVideo) return;
+    setIsExportingVideo(true);
+    if (playTimeoutRef.current) clearTimeout(playTimeoutRef.current);
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.currentTime = 0;
+    }
+    setCinematicActive(false);
+    setCinematicPending(true);
+    playTimeoutRef.current = setTimeout(async () => {
+      playTimeoutRef.current = null;
+      setCinematicPending(false);
+      if (videoEl) videoEl.play().catch(() => {});
+      setCinematicActive(true);
+      // Barra de progreso: rAF propio en vez de atarla al propio recorder
+      // (MediaRecorder no expone progreso) -- simple regla de tres sobre
+      // performance.now(), misma duracion exacta que se le pasa a exportVideo.
+      const durationMs = 15000;
+      const startedAt = performance.now();
+      let rafId = null;
+      const tick = () => {
+        const elapsed = performance.now() - startedAt;
+        setVideoExportProgress(Math.min(elapsed / durationMs, 1));
+        if (elapsed < durationMs) rafId = requestAnimationFrame(tick);
+      };
+      setVideoExportProgress(0);
+      rafId = requestAnimationFrame(tick);
+      try {
+        const preset = VIDEO_QUALITY_PRESETS[videoQuality] ?? VIDEO_QUALITY_PRESETS.medium;
+        await captureApiRef.current?.exportVideo?.({ durationMs, ...preset });
+      } finally {
+        if (rafId != null) cancelAnimationFrame(rafId);
+        setVideoExportProgress(0);
+        setIsExportingVideo(false);
+      }
+    }, startDelaySec * 1000);
+  }, [isExportingVideo, videoEl, startDelaySec, videoQuality]);
+
   cinematicActionsRef.current = {
     captureA,
     captureBAndSave,
@@ -1251,6 +1434,8 @@ export default function App() {
     deleteAllShots,
     previewShot,
     copyShotsFile,
+    handlePlayToggle,
+    handleExportVideo,
   };
 
   // lidStart/lidEnd/lidEase son fijos (CINEMATIC_CONFIG, ya no editables
@@ -1360,6 +1545,8 @@ export default function App() {
     }
   }, [exportFormat, exportQuality, exportTransparentBg, exportAspect, isExporting]);
 
+  exportActionsRef.current = { handleExportImage: handleExport };
+
   const imageTransform = useMemo(
     () => ({ scaleX: imgScaleX, scaleY: imgScaleY, offsetX, offsetY, rotation: imgRotation }),
     [imgScaleX, imgScaleY, offsetX, offsetY, imgRotation]
@@ -1397,13 +1584,25 @@ export default function App() {
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
     >
-      <Leva
-        collapsed={{ collapsed: levaCollapsed, onChange: setLevaCollapsed }}
-        titleBar={{ title: 'Scene Controls' }}
-        className="leva-container"
-      />
+      {/* El panel de Tweakpane no es un componente React: se auto-inserta
+          como overlay fixed en document.body la primera vez que algun
+          useTweak() corre (ver getPane() en useTweak.js) -- no hace falta
+          nada aca en el JSX. */}
 
       <LoadingOverlay />
+
+      {/* Fuera del <canvas> a proposito: captureStream() (ver exportVideo en
+          CaptureRig) solo graba los pixeles del canvas WebGL, asi que esta
+          barra jamas puede terminar en el .webm exportado, sea cual sea su
+          z-index/posicion. */}
+      {isExportingVideo && (
+        <div className="video-export-progress-track">
+          <div
+            className="video-export-progress-fill"
+            style={{ width: `${Math.round(videoExportProgress * 100)}%` }}
+          />
+        </div>
+      )}
 
       <div className="hud">
         <div className="hud-title">MacBook Mockup Studio</div>
@@ -1441,22 +1640,12 @@ export default function App() {
         </div>
       )}
 
-      {gridEnabled && !cinematicActive && <CompositionGrid />}
-
-      {!hideExportUI && (
-        <ExportPanel
-          aspect={exportAspect}
-          onAspectChange={setExportAspect}
-          format={exportFormat}
-          onFormatChange={setExportFormat}
-          quality={exportQuality}
-          onQualityChange={setExportQuality}
-          transparentBg={exportTransparentBg}
-          onTransparentBgChange={setExportTransparentBg}
-          onExport={handleExport}
-          exporting={isExporting}
-        />
-      )}
+      {/* hideExportUI: ya no hay panel DOM que ocultar (ExportPanel.jsx se
+          elimino -- sus controles viven ahora en el folder 'Export' del
+          panel), asi que el toggle paso a tapar la guia de encuadre, para
+          poder sacar una captura/export limpios sin tener que apagar
+          'grid' a mano y despues prenderla de nuevo. */}
+      {gridEnabled && !cinematicActive && !hideExportUI && <CompositionGrid />}
 
       <div className="canvas-wrap">
         <Canvas
@@ -1551,6 +1740,13 @@ export default function App() {
               environmentIntensity={envIntensity}
               environmentRotation={envRotation}
               backgroundRotation={envRotation}
+              // Resolucion del cubemap/PMREM que usan los materiales para
+              // reflejar (scene.environment) -- default de drei es 256, muy
+              // bajo para un reflejo nitido en una superficie casi plana y
+              // grande como el vidrio de la pantalla (se nota pixelado/
+              // blureado). Costo es UNA SOLA VEZ al cambiar de HDRI (PMREM
+              // horneado), no por frame, 1024 es seguro.
+              resolution={1024}
             />
           ) : (
             <Environment
@@ -1560,6 +1756,7 @@ export default function App() {
               environmentIntensity={envIntensity}
               environmentRotation={envRotation}
               backgroundRotation={envRotation}
+              resolution={1024}
             />
           )}
 

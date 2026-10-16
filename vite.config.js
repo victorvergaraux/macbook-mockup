@@ -10,14 +10,14 @@ export default defineConfig({
     rollupOptions: {
       output: {
         // Separa en chunks propios lo que no hace falta para el primer
-        // frame: 'leva' solo se ejecuta cuando el panel de controles se
+        // frame: 'tweakpane' solo se ejecuta cuando el panel de controles se
         // pinta, 'postfx' solo cuando el EffectComposer monta -- ambos ya
         // detras de un frame de React, nunca bloquean el render inicial.
         // 'three' + r3f quedan juntos (es lo que sí hace falta desde el
         // primer momento) para no fragmentar de mas.
         manualChunks: {
           three: ['three', '@react-three/fiber', '@react-three/drei'],
-          leva: ['leva'],
+          tweakpane: ['tweakpane'],
           postfx: ['postprocessing', '@react-three/postprocessing'],
         },
       },
